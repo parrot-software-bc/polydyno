@@ -1,0 +1,17 @@
+# Environment & secrets
+.env
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Dyno run outputs (keep directory placeholder)
+results/*
+!results/.gitkeep

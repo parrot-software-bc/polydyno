@@ -1,0 +1,57 @@
+# Production-grade invariants for polycracker-dyno (AST-enforced).
+version: 3
+
+invariants:
+  - id: 1
+    name: preserve_fk_user_id
+    category: Referential
+    scope: schema.sql
+    rule: >
+      orders.user_id must remain NOT NULL and maintain CONSTRAINT fk_user_id
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE.
+
+  - id: 2
+    name: preserve_monetary_integer_precision
+    category: Financial
+    scope: schema.sql
+    rule: >
+      Monetary columns (total_cents, amount_cents, discount_cents, shipping_cents,
+      unit_cents) must use exact integer types (BIGINT, INT, INTEGER, SMALLINT),
+      never floating-point (FLOAT, REAL, DOUBLE PRECISION) or unconstrained NUMERIC.
+
+  - id: 3
+    name: preserve_users_email_uniqueness
+    category: Identity
+    scope: schema.sql
+    rule: >
+      users.email must remain NOT NULL and UNIQUE (column or table constraint).
+
+  - id: 4
+    name: ast_syntax_validity
+    category: Compiler
+    scope: schema.sql
+    rule: >
+      Output must contain valid, parseable PostgreSQL DDL with zero syntax errors.
+
+  - id: 5
+    name: temporal_state_consistency
+    category: Temporal
+    scope: schema.sql
+    rule: >
+      Turn 12+: orders.status CHECK must allow 'disputed'. Turn 28+: supersede with
+      'chargeback_pending' and forbid 'disputed' (no attention ghosting from older turns).
+
+  - id: 6
+    name: cross_artifact_type_sync
+    category: Dual-AST
+    scope: outlaw
+    rule: >
+      Outlaw mode requires synchronized Pydantic v2 OrderModel/UserModel python blocks;
+      all orders columns present, user_id never Optional, *_cents never float.
+
+  - id: 7
+    name: thermal_efficiency
+    category: Eddy-Current
+    scope: telemetry
+    rule: >
+      Flag thermal bloat when input context exceeds 50x the useful schema artifact size.

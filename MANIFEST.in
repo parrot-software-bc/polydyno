@@ -1,0 +1,7 @@
+include LICENSE
+include schema.sql
+include invariants.yaml
+include requirements.txt
+recursive-exclude venv *
+recursive-exclude results *
+global-exclude *.pyc
