@@ -36,7 +36,7 @@ polydyno = "dyno_test:main"
 polycracker = "dyno_test:main"
 
 [project.urls]
-Homepage = "https://polycracker.com"
+Homepage = "https://polycracker.dev"
 
 [tool.setuptools]
 include-package-data = true

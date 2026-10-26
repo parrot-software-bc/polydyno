@@ -1,6 +1,6 @@
 # 🏎️ Polydyno
 
-**By [Polycracker](https://polycracker.com)** — the 50-turn adversarial context drift and invariant benchmark harness for AI coding agents.
+**By [Polycracker](https://polycracker.dev)** — the 50-turn adversarial context drift and invariant benchmark harness for AI coding agents.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -177,7 +177,7 @@ Custom `--schema` / `--invariants` paths produce a different hash (**CUSTOM WORK
 
 Polydyno shows **where** agents lose torque: FK drift, monetary regression, temporal ghosting, dual-artifact desync, and thermal bloat from runaway history. Production fixes usually need **tighter invariants**, **smaller effective context**, and **structured memory**—not longer prompts alone.
 
-**[Polycracker](https://polycracker.com)** provides an MCP server and tooling to stop multi-turn context detonation: enforce rules at the edge, compress what the model re-reads each turn, and keep schema state canonical across long agent sessions.
+**[Polycracker](https://polycracker.dev)** provides an MCP server and tooling to stop multi-turn context detonation: enforce rules at the edge, compress what the model re-reads each turn, and keep schema state canonical across long agent sessions.
 
 Run the dyno → read the autopsy and PolyScore → tune with Polycracker MCP so the next pull keeps torque up and thermal grade out of the basement.
 

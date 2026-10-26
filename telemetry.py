@@ -341,7 +341,7 @@ def _cta_footer_markdown() -> str:
         ## Polycracker
 
         > **Stop Context Detonation.** Eliminate multi-turn drift and cut token overhead with the
-        > **Polycracker MCP Server** → [polycracker.com](https://polycracker.com)
+        > **Polycracker MCP Server** → [polycracker.dev](https://polycracker.dev)
         """
     ).strip()
 
@@ -777,7 +777,7 @@ def export_html_dyno_chart(
     </div>
     <div class="cta">
       🏎️ Stop Context Detonation. Eliminate multi-turn drift and cut token overhead with the Polycracker MCP Server →
-      <a href="https://polycracker.com" target="_blank" rel="noopener">polycracker.com</a>
+      <a href="https://polycracker.dev" target="_blank" rel="noopener">polycracker.dev</a>
     </div>
   </div>
   <script>
