@@ -51,6 +51,7 @@ class TurnRecord(BaseModel):
     thermal_efficiency_ratio: float = 0.0
     token_multiplier: float = 0.0
     thermal_bloat: bool = False
+    status: str | None = None
     notes: str = ""
 
 
@@ -79,6 +80,8 @@ class DynoDashboard:
         self._live: Live | None = None
 
     def _status_label(self, row: TurnRecord) -> str:
+        if row.status == "API_ERROR":
+            return "API ERROR"
         if not row.invariant_intact:
             return "🔴 DRIFT"
         if row.thermal_bloat:
@@ -353,7 +356,9 @@ def _telemetry_table_markdown(sheet: DynoRunSheet) -> str:
     )
     rows: list[str] = []
     for t in sheet.turns:
-        if not t.invariant_intact:
+        if t.status == "API_ERROR":
+            status = "API_ERROR"
+        elif not t.invariant_intact:
             status = "DRIFT"
         elif t.thermal_bloat:
             status = "BLOAT"

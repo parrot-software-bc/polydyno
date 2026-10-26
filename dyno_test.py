@@ -11,6 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import argparse
 import os
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from autopsy import build_black_box_autopsy, render_autopsy_console
-from providers import DEFAULT_MODELS, LLMRunner, ProviderName, SimulatedRunner
+from providers import DEFAULT_MODELS, LLMRunner, ProviderName, SimulatedRunner, TurnCompletion
 from telemetry import (
     DynoDashboard,
     DynoRunSheet,
@@ -30,7 +31,7 @@ from telemetry import (
     finalize_polyscore,
     render_summary,
 )
-from validator import extract_sql_block, validate_response
+from validator import extract_sql_block, load_invariants, validate_response
 from workload import LoadStage, build_workload_turns, compute_workload_verification_hash
 
 ROOT = Path(__file__).resolve().parent
@@ -45,7 +46,7 @@ def _console() -> "Console":
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             try:
-                reconfigure(encoding="utf-8")
+                reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
     return Console()
@@ -188,6 +189,43 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"--prompt-file not found: {args.prompt_file}")
 
 
+def _run_turn_with_retry(runner: LLMRunner | SimulatedRunner, prompt: str) -> TurnCompletion:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return runner.run_turn(prompt)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(3)
+    assert last_error is not None
+    raise last_error
+
+
+def _record_api_error_turn(
+    *,
+    workload_turn,
+    latency_ms: float,
+    diagnostic: str,
+    runner: LLMRunner | SimulatedRunner,
+    expected_artifact_count: int,
+) -> TurnRecord:
+    retention = f"0/{expected_artifact_count}" if expected_artifact_count else "0/0"
+    cumulative = getattr(runner, "cumulative_cost_usd", 0.0)
+    return TurnRecord(
+        turn=workload_turn.turn,
+        latency_ms=latency_ms,
+        input_tokens=0,
+        output_tokens=0,
+        cached_input_tokens=0,
+        cumulative_cost_usd=cumulative,
+        retention_score=retention,
+        invariant_intact=False,
+        status="API_ERROR",
+        notes=diagnostic,
+    )
+
+
 def run_compare(sheet_a: str, sheet_b: str) -> int:
     report_path = export_markdown_report_from_paths(sheet_a, sheet_b)
     console = _console()
@@ -202,6 +240,7 @@ def run_dyno(args: argparse.Namespace) -> int:
     mode = args.mode or _default_mode()
     schema_sql = args.schema.read_text(encoding="utf-8")
     invariants_path = str(args.invariants.resolve())
+    invariants = load_invariants(args.invariants)
     load: LoadStage = args.load
     if args.profile == "standard":
         load = "stage1"
@@ -257,16 +296,34 @@ def run_dyno(args: argparse.Namespace) -> int:
 
     try:
         for workload_turn in workload_turns[: args.max_turns]:
-            completion = runner.run_turn(workload_turn.prompt)
+            turn_started = time.perf_counter()
+            try:
+                completion = _run_turn_with_retry(runner, workload_turn.prompt)
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - turn_started) * 1000.0
+                diagnostic = f"API Failure: {exc}"
+                record = _record_api_error_turn(
+                    workload_turn=workload_turn,
+                    latency_ms=elapsed_ms,
+                    diagnostic=diagnostic,
+                    runner=runner,
+                    expected_artifact_count=len(workload_turn.expected_artifacts),
+                )
+                dashboard.record_turn(record)
+                sheet.turns.append(record)
+                exit_code = 1
+                continue
+
             validation = validate_response(
                 completion.assistant_text,
-                invariants_path,
+                invariants_path=invariants_path,
                 expected_artifacts=workload_turn.expected_artifacts,
                 turn_milestone=workload_turn.expected_artifact,
                 turn_number=workload_turn.turn,
                 load_stage=load,
                 input_tokens=completion.input_tokens,
                 output_tokens=completion.output_tokens,
+                invariants=invariants,
             )
 
             notes = validation.diagnostic_reason

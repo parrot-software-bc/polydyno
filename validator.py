@@ -15,8 +15,14 @@ from pydantic import BaseModel, Field
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
-SQL_BLOCK_PATTERN = re.compile(r"```sql\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
-PYTHON_BLOCK_PATTERN = re.compile(r"```python\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+SQL_BLOCK_PATTERN = re.compile(
+    r"```\s*sql\s*(?:\r?\n)?(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+PYTHON_BLOCK_PATTERN = re.compile(
+    r"```\s*python\s*(?:\r?\n)?(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
 STATUS_IN_CHECK_PATTERN = re.compile(
     r"status\s+in\s*\((.*?)\)",
     re.IGNORECASE | re.DOTALL,
@@ -118,11 +124,15 @@ class SchemaAST:
                     self.alter_constraints.add("constraint:orders.status_check")
 
 
-def _load_invariants(invariants_path: str) -> list[InvariantSpec]:
+def load_invariants(invariants_path: str | Path) -> list[InvariantSpec]:
     path = Path(invariants_path)
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     raw = data.get("invariants") or []
     return [InvariantSpec.model_validate(item) for item in raw]
+
+
+def _load_invariants(invariants_path: str) -> list[InvariantSpec]:
+    return load_invariants(invariants_path)
 
 
 def extract_sql_block(raw_response: str) -> str | None:
@@ -179,18 +189,27 @@ def _check_temporal_state_consistency(schema: SchemaAST, sql: str, turn: int, sp
     return violations
 
 
+def _safe_unparse(node: ast.expr | None) -> str:
+    if node is None:
+        return "<unknown>"
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return "<unknown>"
+
+
 def _annotation_type_name(node: ast.expr) -> str:
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Constant):
         return str(node.value)
     if isinstance(node, ast.Subscript):
-        return ast.unparse(node)
+        return _safe_unparse(node)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         return f"{_annotation_type_name(node.left)} | {_annotation_type_name(node.right)}"
     if isinstance(node, ast.Attribute):
-        return ast.unparse(node)
-    return ast.unparse(node)
+        return _safe_unparse(node)
+    return _safe_unparse(node)
 
 
 def _model_fields(py_source: str, class_name: str) -> dict[str, str]:
@@ -200,6 +219,8 @@ def _model_fields(py_source: str, class_name: str) -> dict[str, str]:
             fields: dict[str, str] = {}
             for stmt in node.body:
                 if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    if getattr(stmt, "annotation", None) is None:
+                        continue
                     fields[stmt.target.id] = _annotation_type_name(stmt.annotation)
             return fields
     return {}
@@ -273,25 +294,38 @@ def _column_is_unique(column: exp.ColumnDef) -> bool:
     return False
 
 
-def _table_has_unique_email(create_stmt: exp.Create) -> bool:
-    schema = create_stmt.find(exp.Schema)
+def _table_has_unique_email(users_expr: exp.Create) -> bool:
+    schema = users_expr.find(exp.Schema)
     if not schema:
         return False
+
     email_not_null = False
     email_unique = False
-    for expr in schema.expressions:
-        if isinstance(expr, exp.ColumnDef) and expr.name.lower() == "email":
-            email_not_null = _column_is_not_null(expr)
-            email_unique = _column_is_unique(expr)
-        if isinstance(expr, exp.Constraint):
-            unique = expr.find(exp.Unique)
-            if unique:
-                cols = [c.name.lower() for c in unique.find_all(exp.Column)]
-                if "email" in cols:
+
+    for col_def in users_expr.find_all(exp.ColumnDef):
+        if col_def.name.lower() != "email":
+            continue
+        email_not_null = _column_is_not_null(col_def)
+        if col_def.find(exp.UniqueColumnConstraint) or _column_is_unique(col_def):
+            email_unique = True
+        elif "UNIQUE" in col_def.sql().upper():
+            email_unique = True
+
+    for constraint in users_expr.find_all(exp.Constraint):
+        for unique in constraint.find_all(exp.UniqueColumnConstraint):
+            for col in unique.find_all(exp.Column):
+                if col.name.lower() == "email":
                     email_unique = True
-            check = expr.find(exp.Check)
-            if check and "email" in check.sql().lower():
-                email_not_null = email_not_null or True
+            for ident in unique.find_all(exp.Identifier):
+                if ident.name.lower() == "email":
+                    email_unique = True
+        check = constraint.find(exp.Check)
+        if check and "email" in check.sql().lower():
+            email_not_null = True
+        constraint_sql = constraint.sql()
+        if "UNIQUE" in constraint_sql.upper() and "email" in constraint_sql.lower():
+            email_unique = True
+
     return email_not_null and email_unique
 
 
@@ -405,18 +439,31 @@ def _check_preserve_users_email_uniqueness(schema: SchemaAST, spec: InvariantSpe
     return []
 
 
+def _check_expression_sql(node: exp.Expression) -> str:
+    check = node.find(exp.Check)
+    if check is not None:
+        return check.sql()
+    col_check = node.find(exp.CheckColumnConstraint)
+    if col_check is not None:
+        return col_check.sql()
+    return ""
+
+
 def _users_email_check_present(schema: SchemaAST) -> bool:
     users = schema.tables.get("users")
     if users is None:
         return False
-    order_schema = users.find(exp.Schema)
-    if not order_schema:
-        return False
-    for expr in order_schema.expressions:
-        if isinstance(expr, exp.Constraint):
-            check = expr.find(exp.Check)
-            if check and "email" in check.sql().lower() and "@" in check.sql():
+    for col_def in users.find_all(exp.ColumnDef):
+        if col_def.name.lower() != "email":
+            continue
+        for check_node in col_def.find_all(exp.CheckColumnConstraint):
+            check_sql = check_node.sql().lower()
+            if "email" in check_sql and "@" in check_sql:
                 return True
+    for constraint in users.find_all(exp.Constraint):
+        check_sql = _check_expression_sql(constraint).lower()
+        if check_sql and "email" in check_sql and "@" in check_sql:
+            return True
     return False
 
 
@@ -424,14 +471,16 @@ def _orders_status_check_present(schema: SchemaAST) -> bool:
     orders = schema.tables.get("orders")
     if orders is None:
         return False
-    order_schema = orders.find(exp.Schema)
-    if not order_schema:
-        return False
-    for expr in order_schema.expressions:
-        if isinstance(expr, exp.Constraint):
-            check = expr.find(exp.Check)
-            if check and "status" in check.sql().lower():
+    for col_def in orders.find_all(exp.ColumnDef):
+        if col_def.name.lower() != "status":
+            continue
+        for check_node in col_def.find_all(exp.CheckColumnConstraint):
+            if "status" in check_node.sql().lower():
                 return True
+    for constraint in orders.find_all(exp.Constraint):
+        check_sql = _check_expression_sql(constraint).lower()
+        if check_sql and "status" in check_sql:
+            return True
     return False
 
 
@@ -495,7 +544,7 @@ def _build_diagnostic(violated: list[str]) -> str:
 
 def validate_response(
     raw_response: str,
-    invariants_path: str,
+    invariants_path: str | None = None,
     expected_artifacts: list[str] | None = None,
     turn_milestone: str | None = None,
     *,
@@ -503,8 +552,12 @@ def validate_response(
     load_stage: LoadStage = "stage2",
     input_tokens: int = 0,
     output_tokens: int = 0,
+    invariants: list[InvariantSpec] | None = None,
 ) -> ValidationResult:
-    invariants = _load_invariants(invariants_path)
+    if invariants is None:
+        if invariants_path is None:
+            raise ValueError("validate_response requires invariants_path or invariants=")
+        invariants = _load_invariants(invariants_path)
     sql = extract_sql_block(raw_response)
     if sql is None:
         eff, mult, bloat = compute_thermal_metrics(
