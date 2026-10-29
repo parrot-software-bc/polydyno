@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import ssl
 import time
-from pathlib import Path
+import urllib.error
+import urllib.request
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -41,6 +44,45 @@ _PROVIDER_DEFAULT_PRICING: dict[ProviderName, tuple[float, float]] = {
 }
 
 CACHED_INPUT_DISCOUNT = 0.5
+HTTP_TIMEOUT_SEC = 120
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+class ProviderHTTPError(RuntimeError):
+    """Non-success HTTP response from a live provider."""
+
+
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    timeout: float = HTTP_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    context = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ProviderHTTPError(
+            f"HTTP {exc.code} from {url}: {detail or exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ProviderHTTPError(f"Request to {url} failed: {exc.reason}") from exc
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ProviderHTTPError(f"Expected JSON object from {url}")
+    return data
+
+
+def _openai_uses_max_completion_tokens(model: str) -> bool:
+    lowered = model.lower()
+    if lowered.startswith("o1") or lowered.startswith("o3"):
+        return True
+    return "reasoning" in lowered
 
 
 class TurnCompletion(BaseModel):
@@ -74,29 +116,6 @@ class LLMRunner:
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or None
         self.messages: list[dict[str, str]] = []
         self.cumulative_cost_usd: float = 0.0
-        self._client: Any = None
-
-    def _ensure_client(self) -> Any:
-        if self._client is not None:
-            return self._client
-        if self.provider == "anthropic":
-            import anthropic
-
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise RuntimeError("ANTHROPIC_API_KEY is required for live Anthropic runs.")
-            self._client = anthropic.Anthropic(api_key=api_key)
-        else:
-            import openai
-
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if not api_key:
-                raise RuntimeError("OPENAI_API_KEY is required for live OpenAI-compatible runs.")
-            kwargs: dict[str, Any] = {"api_key": api_key}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
-            self._client = openai.OpenAI(**kwargs)
-        return self._client
 
     def _pricing(self) -> tuple[float, float]:
         return PRICING_USD_PER_MTOK.get(self.model, _PROVIDER_DEFAULT_PRICING[self.provider])
@@ -117,60 +136,92 @@ class LLMRunner:
             + (output_tokens / 1_000_000) * out_rate
         )
 
-    @staticmethod
-    def _cached_tokens_openai(usage: Any) -> int:
-        if usage is None:
-            return 0
-        details = getattr(usage, "prompt_tokens_details", None)
-        if details is not None:
-            cached = getattr(details, "cached_tokens", None)
-            if cached is not None:
-                return int(cached)
-        return int(getattr(usage, "cached_tokens", 0) or 0)
-
-    @staticmethod
-    def _cached_tokens_anthropic(usage: Any) -> int:
-        if usage is None:
-            return 0
-        cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-        if cache_read:
-            return cache_read
-        return int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-
     def _call_anthropic(self) -> tuple[str, int, int, int]:
-        client = self._ensure_client()
-        kwargs: dict[str, Any] = {
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for live Anthropic runs.")
+        payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_output_tokens,
             "messages": self.messages,
         }
         if self.system_prompt:
-            kwargs["system"] = self.system_prompt
-        response = client.messages.create(**kwargs)
-        text = "".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
+            payload["system"] = self.system_prompt
+        data = _post_json(
+            "https://api.anthropic.com/v1/messages",
+            payload,
+            {
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
         )
-        usage = response.usage
-        cached = self._cached_tokens_anthropic(usage)
-        return text, usage.input_tokens, usage.output_tokens, cached
+        parts = [
+            block.get("text", "")
+            for block in data.get("content") or []
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        usage = data.get("usage") or {}
+        cached = int(usage.get("cache_read_input_tokens") or 0)
+        if not cached:
+            cached = int(usage.get("cache_creation_input_tokens") or 0)
+        return (
+            "".join(parts),
+            int(usage.get("input_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+            cached,
+        )
 
     def _call_openai(self) -> tuple[str, int, int, int]:
-        client = self._ensure_client()
+        if self.base_url:
+            api_key = os.environ.get("OPENAI_API_KEY", "EMPTY")
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY is required for live OpenAI-compatible runs.")
+
+        root = (self.base_url or "https://api.openai.com/v1").rstrip("/")
         messages: list[dict[str, str]] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.extend(self.messages)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_output_tokens,
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if _openai_uses_max_completion_tokens(self.model):
+            payload["max_completion_tokens"] = self.max_output_tokens
+        else:
+            payload["max_tokens"] = self.max_output_tokens
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key and api_key.strip() and api_key.strip().upper() != "EMPTY":
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+        data = _post_json(f"{root}/chat/completions", payload, headers)
+        choices = data.get("choices") or [{}]
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if content is None:
+            text = ""
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = str(content)
+
+        usage = data.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        cached = int(details.get("cached_tokens") or usage.get("cached_tokens") or 0)
+        return (
+            text,
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+            cached,
         )
-        choice = response.choices[0].message.content or ""
-        usage = response.usage
-        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
-        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
-        cached = self._cached_tokens_openai(usage)
-        return choice, input_tokens, output_tokens, cached
 
     def run_turn(self, user_prompt: str) -> TurnCompletion:
         self.messages.append({"role": "user", "content": user_prompt})
