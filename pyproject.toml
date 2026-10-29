@@ -43,6 +43,7 @@ include-package-data = true
 py-modules = [
     "autopsy",
     "dyno_test",
+    "polydyno",
     "providers",
     "telemetry",
     "validator",

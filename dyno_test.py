@@ -38,6 +38,58 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SCHEMA_PATH = ROOT / "schema.sql"
 DEFAULT_INVARIANTS_PATH = ROOT / "invariants.yaml"
 
+_CONSOLE_SCRIPT_BASENAMES = frozenset(
+    {
+        "polydyno.exe",
+        "polycracker.exe",
+        "polydyno-script.py",
+        "polycracker-script.py",
+        "polydyno",
+        "polycracker",
+        "dyno_test.py",
+        "polydyno.py",
+        "__main__.py",
+    }
+)
+
+
+def _looks_like_program_token(token: str) -> bool:
+    name = Path(token).name.lower()
+    if name in _CONSOLE_SCRIPT_BASENAMES:
+        return True
+    if name.endswith((".exe", "-script.py")) and ("polydyno" in name or "polycracker" in name):
+        return True
+    return name == "dyno_test.py" or name == "polydyno.py"
+
+
+def _normalize_cli_argv(argv: list[str] | None) -> list[str]:
+    """Build an argparse-safe argv list (no program name / launcher duplicates)."""
+    if argv is None:
+        raw = sys.argv[1:]
+    else:
+        raw = list(argv)
+        if raw and _looks_like_program_token(raw[0]):
+            raw = raw[1:]
+
+    launcher_resolved: set[Path] = set()
+    for candidate in (sys.argv[:1] if sys.argv else []):
+        try:
+            launcher_resolved.add(Path(candidate).resolve())
+        except OSError:
+            pass
+
+    normalized: list[str] = []
+    for token in raw:
+        if _looks_like_program_token(token):
+            continue
+        try:
+            if Path(token).resolve() in launcher_resolved:
+                continue
+        except OSError:
+            pass
+        normalized.append(token)
+    return normalized
+
 
 def _console() -> "Console":
     from rich.console import Console
@@ -175,7 +227,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Deprecated alias: standard->stage1, adversarial->stage2",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(_normalize_cli_argv(argv))
 
 
 def _validate_args(args: argparse.Namespace) -> None:
