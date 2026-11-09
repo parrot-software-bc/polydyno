@@ -18,7 +18,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from autopsy import build_black_box_autopsy, render_autopsy_console
+from autopsy import build_black_box_autopsy, compute_unified_sql_diff, render_autopsy_console
 from providers import DEFAULT_MODELS, LLMRunner, ProviderName, SimulatedRunner, TurnCompletion
 from telemetry import (
     DynoDashboard,
@@ -31,8 +31,14 @@ from telemetry import (
     finalize_polyscore,
     render_summary,
 )
-from validator import extract_sql_block, load_invariants, validate_response
-from workload import LoadStage, build_workload_turns, compute_workload_verification_hash
+from validator import ValidationResult, extract_sql_block, load_invariants, validate_response
+from workload import (
+    InvariantMode,
+    LoadStage,
+    build_workload_turns,
+    compute_workload_verification_hash,
+    decorate_turn_prompt,
+)
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SCHEMA_PATH = ROOT / "schema.sql"
@@ -227,7 +233,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Deprecated alias: standard->stage1, adversarial->stage2",
     )
+    parser.add_argument(
+        "--invariant-mode",
+        choices=("baseline", "prose-repeat", "ledger", "verify-commit"),
+        default="baseline",
+        help="Experimental invariant enforcement mode (default: baseline)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Self-repair retry budget per turn on validation failure (default: 0, or 3 when --invariant-mode verify-commit)",
+    )
     return parser.parse_args(_normalize_cli_argv(argv))
+
+
+def _resolve_max_retries(args: argparse.Namespace) -> int:
+    if args.max_retries is not None:
+        return args.max_retries
+    if getattr(args, "invariant_mode", "baseline") == "verify-commit":
+        return 3
+    return 0
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -237,6 +264,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-turns must be at least 1")
     if args.max_turns > 50:
         raise SystemExit("--max-turns cannot exceed 50")
+    if args.max_retries is not None and args.max_retries < 0:
+        raise SystemExit("--max-retries cannot be negative")
     if args.prompt_file is not None and not args.prompt_file.is_file():
         raise SystemExit(f"--prompt-file not found: {args.prompt_file}")
 
@@ -252,6 +281,62 @@ def _run_turn_with_retry(runner: LLMRunner | SimulatedRunner, prompt: str) -> Tu
                 time.sleep(3)
     assert last_error is not None
     raise last_error
+
+
+def _run_repair_with_api_retry(
+    runner: LLMRunner | SimulatedRunner,
+    feedback_prompt: str,
+    retry_attempt: int,
+) -> TurnCompletion:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return runner.run_repair_attempt(feedback_prompt, retry_attempt)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(3)
+    assert last_error is not None
+    raise last_error
+
+
+def _build_repair_feedback_prompt(
+    *,
+    turn_number: int,
+    last_valid_turn: int,
+    validation: ValidationResult,
+    initial_failed_invariants: set[str],
+    schema_before: str,
+    schema_after: str,
+    retry_attempt: int,
+    max_retries: int,
+    load_stage: LoadStage,
+) -> str:
+    diff_text = compute_unified_sql_diff(
+        schema_before,
+        schema_after,
+        previous_turn=last_valid_turn,
+        drift_turn=turn_number,
+    )
+    failed_ids = ", ".join(validation.failed_invariant_ids) or "UNKNOWN"
+    init_ids = ", ".join(sorted(initial_failed_invariants)) or "UNKNOWN"
+    outlaw_hint = (
+        "\nAlso include the synchronized ```python block with UserModel and OrderModel."
+        if load_stage == "outlaw"
+        else ""
+    )
+    return (
+        f"[SELF-REPAIR VERIFICATION REJECTED — Turn {turn_number:02d}, Attempt {retry_attempt}/{max_retries}]\n"
+        f"Your proposed schema failed pre-commit AST/invariant verification and was NOT committed.\n\n"
+        f"Initial failed invariant IDs on Attempt 0: [{init_ids}]\n"
+        f"Currently failing invariant IDs: [{failed_ids}]\n"
+        f"Validator diagnostic: {validation.diagnostic_reason}\n\n"
+        f"Unified SQL diff against last valid state (Turn {last_valid_turn:02d}):\n"
+        f"```diff\n{diff_text or '(no diff)'}\n```\n\n"
+        f"Repair the violations above without introducing cascading regressions in previously passing "
+        f"invariants (preserve fk_user_id ON DELETE CASCADE, integer *_cents columns, users.email UNIQUE NOT NULL, "
+        f"and all prior indexes/tables/columns). Return the complete corrected PostgreSQL DDL in a ```sql block.{outlaw_hint}"
+    )
 
 
 def _record_api_error_turn(
@@ -301,11 +386,15 @@ def run_dyno(args: argparse.Namespace) -> int:
     workload_turns = build_workload_turns(load)
     system_prompt = _build_system_prompt(schema_sql, args.invariants, args.prompt_file)
     base_url = args.base_url or os.environ.get("OPENAI_BASE_URL") or None
+    invariant_mode: InvariantMode = getattr(args, "invariant_mode", "baseline")
+    max_retries = _resolve_max_retries(args)
 
     if mode == "sim":
         runner: LLMRunner | SimulatedRunner = SimulatedRunner(
             system_prompt=system_prompt,
             load_stage=load,
+            invariant_mode=invariant_mode,
+            max_retries=max_retries,
         )
         provider_label = "sim"
         model_label = "simulated"
@@ -334,6 +423,8 @@ def run_dyno(args: argparse.Namespace) -> int:
             "invariants_path": invariants_path,
             "load": load,
             "profile": "standard" if load == "stage1" else "adversarial",
+            "invariant_mode": invariant_mode,
+            "max_retries": max_retries,
             "base_url": base_url,
             "prompt_file": str(args.prompt_file.resolve()) if args.prompt_file else None,
         },
@@ -349,8 +440,14 @@ def run_dyno(args: argparse.Namespace) -> int:
     try:
         for workload_turn in workload_turns[: args.max_turns]:
             turn_started = time.perf_counter()
+            effective_prompt = decorate_turn_prompt(
+                workload_turn.prompt,
+                invariant_mode=invariant_mode,
+                invariants=invariants,
+            )
+            snapshot_len = len(runner.messages)
             try:
-                completion = _run_turn_with_retry(runner, workload_turn.prompt)
+                completion = _run_turn_with_retry(runner, effective_prompt)
             except Exception as exc:
                 elapsed_ms = (time.perf_counter() - turn_started) * 1000.0
                 diagnostic = f"API Failure: {exc}"
@@ -378,25 +475,109 @@ def run_dyno(args: argparse.Namespace) -> int:
                 invariants=invariants,
             )
 
+            initial_failed_list = list(validation.failed_invariant_ids)
+            initial_failed_set = set(initial_failed_list)
+            seen_cascading_ids: set[str] = set()
+            repair_attempts = 0
+            recovery_tokens = 0
+            total_in_tokens = completion.input_tokens
+            total_out_tokens = completion.output_tokens
+            total_cached_tokens = completion.cached_input_tokens
+            total_latency_ms = completion.latency_ms
+            latest_completion = completion
+            current_sql = extract_sql_block(completion.assistant_text) or ""
+
+            if not validation.passed and max_retries > 0:
+                for retry_idx in range(1, max_retries + 1):
+                    feedback_prompt = _build_repair_feedback_prompt(
+                        turn_number=workload_turn.turn,
+                        last_valid_turn=last_valid_turn,
+                        validation=validation,
+                        initial_failed_invariants=initial_failed_set,
+                        schema_before=last_valid_sql,
+                        schema_after=current_sql,
+                        retry_attempt=retry_idx,
+                        max_retries=max_retries,
+                        load_stage=load,
+                    )
+                    retry_completion = _run_repair_with_api_retry(
+                        runner,
+                        feedback_prompt,
+                        retry_idx,
+                    )
+                    repair_attempts += 1
+                    attempt_tokens = retry_completion.input_tokens + retry_completion.output_tokens
+                    recovery_tokens += attempt_tokens
+                    total_in_tokens += retry_completion.input_tokens
+                    total_out_tokens += retry_completion.output_tokens
+                    total_cached_tokens += retry_completion.cached_input_tokens
+                    total_latency_ms += retry_completion.latency_ms
+                    latest_completion = retry_completion
+                    current_sql = extract_sql_block(retry_completion.assistant_text) or ""
+
+                    validation = validate_response(
+                        retry_completion.assistant_text,
+                        invariants_path=invariants_path,
+                        expected_artifacts=workload_turn.expected_artifacts,
+                        turn_milestone=workload_turn.expected_artifact,
+                        turn_number=workload_turn.turn,
+                        load_stage=load,
+                        input_tokens=total_in_tokens,
+                        output_tokens=total_out_tokens,
+                        invariants=invariants,
+                    )
+                    current_failed_set = set(validation.failed_invariant_ids)
+                    for new_id in current_failed_set - initial_failed_set:
+                        seen_cascading_ids.add(new_id)
+
+                    if validation.passed:
+                        break
+
+                runner.commit_turn_messages(
+                    snapshot_len,
+                    effective_prompt,
+                    latest_completion.assistant_text,
+                )
+
+            cascading_regressions = len(seen_cascading_ids)
+            recovered_cleanly = bool(
+                validation.passed and repair_attempts > 0 and cascading_regressions == 0
+            )
+
             notes = validation.diagnostic_reason
             if validation.passed:
-                notes = "All invariants satisfied."
-
-            current_sql = extract_sql_block(completion.assistant_text) or ""
+                if repair_attempts > 0:
+                    notes = (
+                        f"Recovered in {repair_attempts} retry(s) "
+                        f"(+{recovery_tokens:,} recovery tokens; "
+                        f"cascading regressions: {cascading_regressions})."
+                    )
+                else:
+                    notes = "All invariants satisfied."
+            elif repair_attempts > 0:
+                notes = (
+                    f"[Retry budget exhausted ({repair_attempts}/{max_retries}); "
+                    f"cascading regressions: {cascading_regressions}] {validation.diagnostic_reason}"
+                )
 
             record = TurnRecord(
                 turn=workload_turn.turn,
-                latency_ms=completion.latency_ms,
-                input_tokens=completion.input_tokens,
-                output_tokens=completion.output_tokens,
-                cached_input_tokens=completion.cached_input_tokens,
-                cumulative_cost_usd=completion.cumulative_cost_usd,
+                latency_ms=total_latency_ms,
+                input_tokens=total_in_tokens,
+                output_tokens=total_out_tokens,
+                cached_input_tokens=total_cached_tokens,
+                cumulative_cost_usd=latest_completion.cumulative_cost_usd,
                 retention_score=validation.retention_score,
                 invariant_intact=validation.passed,
                 thermal_efficiency_ratio=validation.thermal_efficiency_ratio,
                 token_multiplier=validation.token_multiplier,
                 thermal_bloat=validation.thermal_bloat,
                 notes=notes,
+                initial_failed_invariants=initial_failed_list,
+                repair_attempts=repair_attempts,
+                recovery_tokens=recovery_tokens,
+                cascading_regressions=cascading_regressions,
+                recovered_cleanly=recovered_cleanly,
             )
             dashboard.record_turn(record)
             sheet.turns.append(record)

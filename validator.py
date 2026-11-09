@@ -58,6 +58,7 @@ class ValidationResult(BaseModel):
     invariants_intact: bool = False
     retention_score: str = "0/0"
     violated_invariants: list[str] = Field(default_factory=list)
+    failed_invariant_ids: list[str] = Field(default_factory=list)
     diagnostic_reason: str = ""
     thermal_efficiency_ratio: float = 0.0
     token_multiplier: float = 0.0
@@ -155,12 +156,17 @@ def compute_thermal_metrics(
     output_tokens: int,
     schema_sql: str | None,
 ) -> tuple[float, float, bool]:
-    artifact_size = max(len(schema_sql or ""), 1)
+    """Per-turn BSFC metrics: token-normalized multiplier and dual bloat detection."""
     useful = max(output_tokens, 0)
     total_in = max(input_tokens, 1)
+    artifact_chars = max(len(schema_sql or ""), useful * 4, 1)
+    artifact_tokens = max(useful, artifact_chars // 4, 1)
     thermal_efficiency_ratio = useful / total_in
-    token_multiplier = total_in / artifact_size
-    thermal_bloat = total_in > (50 * artifact_size)
+    token_multiplier = total_in / artifact_tokens
+    io_ratio = total_in / max(useful, 1)
+    char_bloat = total_in > (50 * artifact_chars)
+    quadratic_bloat = total_in > 22_000 and io_ratio > 22.0
+    thermal_bloat = char_bloat or quadratic_bloat
     return thermal_efficiency_ratio, token_multiplier, thermal_bloat
 
 
@@ -533,6 +539,31 @@ _INVARIANT_CHECKERS = {
     "preserve_users_email_uniqueness": _check_preserve_users_email_uniqueness,
 }
 
+CANONICAL_INVARIANT_ID_MAP: dict[str, str] = {
+    "schema_output": "INV-00:AST_SYNTAX",
+    "ast_syntax_validity": "INV-00:AST_SYNTAX",
+    "preserve_monetary_integer_precision": "INV-01:INTEGER_CENTS",
+    "preserve_fk_user_id": "INV-02:FK_CASCADE",
+    "workload_retention": "INV-03:INDEX_RETENTION",
+    "workload_milestone": "INV-03:INDEX_RETENTION",
+    "cross_artifact_type_sync": "INV-04:PYDANTIC_SYNC",
+    "preserve_users_email_uniqueness": "INV-05:EMAIL_UNIQUE",
+    "temporal_state_consistency": "INV-06:TEMPORAL_STATUS",
+}
+
+
+def map_violated_to_invariant_ids(violated: list[str], missing_artifacts: list[str] | None = None) -> list[str]:
+    """Map raw violation messages to canonical deduplicated INV-* IDs."""
+    seen: dict[str, None] = {}
+    for entry in violated:
+        prefix = entry.split(":", 1)[0].strip()
+        inv_id = CANONICAL_INVARIANT_ID_MAP.get(prefix)
+        if inv_id:
+            seen[inv_id] = None
+    if missing_artifacts:
+        seen["INV-03:INDEX_RETENTION"] = None
+    return list(seen.keys())
+
 
 def _build_diagnostic(violated: list[str]) -> str:
     if not violated:
@@ -571,6 +602,7 @@ def validate_response(
             invariants_intact=False,
             retention_score="0/0",
             violated_invariants=["schema_output"],
+            failed_invariant_ids=["INV-00:AST_SYNTAX"],
             diagnostic_reason="No ```sql code block found in model response.",
             thermal_efficiency_ratio=eff,
             token_multiplier=mult,
@@ -599,6 +631,7 @@ def validate_response(
             invariants_intact=False,
             retention_score=retention_score,
             violated_invariants=violated,
+            failed_invariant_ids=map_violated_to_invariant_ids(violated, missing),
             diagnostic_reason=diagnostic,
         )
 
@@ -678,6 +711,7 @@ def validate_response(
         invariants_intact=invariants_intact,
         retention_score=retention_score,
         violated_invariants=violated,
+        failed_invariant_ids=map_violated_to_invariant_ids(violated, missing),
         diagnostic_reason=diagnostic,
         thermal_efficiency_ratio=thermal_efficiency_ratio,
         token_multiplier=token_multiplier,

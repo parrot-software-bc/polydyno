@@ -244,6 +244,17 @@ class LLMRunner:
             cumulative_cost_usd=self.cumulative_cost_usd,
         )
 
+    def run_repair_attempt(self, feedback_prompt: str, retry_attempt: int) -> TurnCompletion:
+        """Execute a closed-loop self-repair turn on the live LLM."""
+        _ = retry_attempt
+        return self.run_turn(feedback_prompt)
+
+    def commit_turn_messages(self, snapshot_len: int, user_prompt: str, final_assistant_text: str) -> None:
+        """Rebase turn history to the committed (user_prompt, final_assistant_text) exchange."""
+        del self.messages[snapshot_len:]
+        self.messages.append({"role": "user", "content": user_prompt})
+        self.messages.append({"role": "assistant", "content": final_assistant_text})
+
 
 def _token_estimate(text: str) -> int:
     return max(1, len(text) // 4)
@@ -254,20 +265,43 @@ def _simulated_latency_ms(turn: int) -> float:
     return float(110 + (turn * 23) + (digest % 90))
 
 
-def _simulated_schema(turn: int, load_stage: str = "stage2") -> str:
+def _simulated_schema(
+    turn: int,
+    load_stage: str = "stage2",
+    *,
+    invariant_mode: str = "baseline",
+    retry_attempt: int = 0,
+    max_retries: int = 0,
+) -> str:
     from workload import TURN_SPECS, generate_simulated_python, generate_simulated_sql
 
-    body = generate_simulated_sql(turn)
+    body = generate_simulated_sql(
+        turn,
+        invariant_mode=invariant_mode,  # type: ignore[arg-type]
+        retry_attempt=retry_attempt,
+        max_retries=max_retries,
+    )
     milestone = TURN_SPECS[turn - 1].expected_artifact if turn <= len(TURN_SPECS) else "unknown"
-    if turn >= 17:
+    repair_active = invariant_mode == "verify-commit" or max_retries > 0
+    if not repair_active:
+        drift_onset = 18
+        if invariant_mode == "prose-repeat":
+            drift_onset = 21
+        elif invariant_mode == "ledger":
+            drift_onset = 26
+        is_collapsed = turn >= drift_onset
+    else:
+        is_collapsed = turn >= 31 or (turn in (18, 24) and retry_attempt == 0) or (turn == 18 and retry_attempt == 1)
+
+    if is_collapsed:
         headline = (
-            f"Turn {turn}: simulated compliance collapse — nullable user_id, dropped fk_user_id, "
-            f"FLOAT total_cents, and weakened users.email uniqueness."
+            f"Turn {turn} (attempt {retry_attempt}): simulated compliance drift — "
+            f"schema/invariant check requires verification."
         )
     else:
         headline = f"Applied turn {turn} refactor; milestone `{milestone}` retained."
     parts = [headline, f"```sql\n{body.strip()}\n```"]
-    if load_stage == "outlaw" and turn < 17:
+    if load_stage == "outlaw" and not is_collapsed:
         parts.append(f"```python\n{generate_simulated_python(turn)}\n```")
     return "\n\n".join(parts)
 
@@ -275,9 +309,17 @@ def _simulated_schema(turn: int, load_stage: str = "stage2") -> str:
 class SimulatedRunner:
     """Deterministic zero-cost runner for CI/UI (--sim) with context growth modeling."""
 
-    def __init__(self, system_prompt: str | None = None, load_stage: str = "stage2") -> None:
+    def __init__(
+        self,
+        system_prompt: str | None = None,
+        load_stage: str = "stage2",
+        invariant_mode: str = "baseline",
+        max_retries: int = 0,
+    ) -> None:
         self.system_prompt = system_prompt or "simulated"
         self.load_stage = load_stage
+        self.invariant_mode = invariant_mode
+        self.max_retries = max_retries
         self.messages: list[dict[str, str]] = []
         self.cumulative_cost_usd: float = 0.0
         self._turn: int = 0
@@ -287,14 +329,27 @@ class SimulatedRunner:
         turn = self._turn
         self.messages.append({"role": "user", "content": user_prompt})
 
-        assistant_text = _simulated_schema(turn, self.load_stage)
+        assistant_text = _simulated_schema(
+            turn,
+            self.load_stage,
+            invariant_mode=self.invariant_mode,
+            retry_attempt=0,
+            max_retries=self.max_retries,
+        )
         self.messages.append({"role": "assistant", "content": assistant_text})
 
         history_blob = "\n".join(f"{m['role']}:{m['content']}" for m in self.messages)
         input_tokens = _token_estimate(history_blob) + _token_estimate(self.system_prompt)
         output_tokens = _token_estimate(assistant_text)
-        input_tokens += turn * turn * 180
-        if self.load_stage == "outlaw":
+        if self.invariant_mode == "baseline" and self.max_retries == 0:
+            input_tokens = max(1, (input_tokens - output_tokens) // 12)
+        elif self.invariant_mode == "prose-repeat":
+            input_tokens += turn * turn * 320 + (turn * 1_450)
+        elif self.invariant_mode == "ledger":
+            input_tokens = max(1, (input_tokens - output_tokens) // 10) + (turn * 95)
+        else:
+            input_tokens = max(1, (input_tokens - output_tokens) // 12)
+        if self.load_stage == "outlaw" and not (self.invariant_mode == "baseline" and self.max_retries == 0):
             input_tokens = int(input_tokens * 1.35)
         cached_input_tokens = min(input_tokens // 5, 12_000) if turn > 3 else 0
 
@@ -308,6 +363,37 @@ class SimulatedRunner:
             turn_cost_usd=0.0,
             cumulative_cost_usd=0.0,
         )
+
+    def run_repair_attempt(self, feedback_prompt: str, retry_attempt: int) -> TurnCompletion:
+        """Simulate a self-repair retry without advancing the canonical turn counter."""
+        _ = feedback_prompt
+        turn = self._turn
+        assistant_text = _simulated_schema(
+            turn,
+            self.load_stage,
+            invariant_mode=self.invariant_mode,
+            retry_attempt=retry_attempt,
+            max_retries=self.max_retries,
+        )
+        input_tokens = 240 + (turn * 12) + (retry_attempt * 85)
+        output_tokens = _token_estimate(assistant_text)
+        cached_input_tokens = min(input_tokens // 5, 12_000) if turn > 3 else 0
+        latency_ms = _simulated_latency_ms(turn + retry_attempt)
+        return TurnCompletion(
+            assistant_text=assistant_text,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            turn_cost_usd=0.0,
+            cumulative_cost_usd=0.0,
+        )
+
+    def commit_turn_messages(self, snapshot_len: int, user_prompt: str, final_assistant_text: str) -> None:
+        """Commit only the verified (or final) turn exchange to message history."""
+        del self.messages[snapshot_len:]
+        self.messages.append({"role": "user", "content": user_prompt})
+        self.messages.append({"role": "assistant", "content": final_assistant_text})
 
 
 def runner_from_env(

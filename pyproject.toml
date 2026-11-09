@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polydyno"
-version = "0.1.0"
+version = "0.2.0"
 description = "Polydyno — 50-turn PostgreSQL context drift benchmark (PolyScore, Eddy-Current load, tamper-evident workload)."
 readme = "README.md"
 requires-python = ">=3.10"

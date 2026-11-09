@@ -38,6 +38,15 @@ THERMAL_GRADE_MULTIPLIER: dict[str, float] = {
     "F": 0.30,
 }
 
+# BSFC / context runaway thresholds (scoring only — workload hash unchanged)
+LEAN_RUN_INPUT_BUDGET = 250_000
+CONTEXT_RUNAWAY_INPUT_CAP = 1_100_000
+PRE_FAILURE_TOKEN_CAP = 100_000
+QUADRATIC_BLOAT_INPUT_MIN = 22_000
+QUADRATIC_BLOAT_IO_RATIO = 22.0
+RECOVERY_PENALTY_COEFFICIENT = 1.25
+EFFECTIVE_THERMAL_FLOOR = 0.45
+
 
 class TurnRecord(BaseModel):
     turn: int
@@ -53,6 +62,11 @@ class TurnRecord(BaseModel):
     thermal_bloat: bool = False
     status: str | None = None
     notes: str = ""
+    initial_failed_invariants: list[str] = Field(default_factory=list)
+    repair_attempts: int = 0
+    recovery_tokens: int = 0
+    cascading_regressions: int = 0
+    recovered_cleanly: bool = False
 
 
 class DynoRunSheet(BaseModel):
@@ -83,7 +97,13 @@ class DynoDashboard:
         if row.status == "API_ERROR":
             return "API ERROR"
         if not row.invariant_intact:
+            if row.repair_attempts > 0:
+                return f"🔴 DRIFT ({row.repair_attempts}R)"
             return "🔴 DRIFT"
+        if row.repair_attempts > 0:
+            if row.cascading_regressions > 0:
+                return f"🟠 REPAIRED ({row.repair_attempts}R/{row.cascading_regressions}C)"
+            return f"🟢 REPAIRED ({row.repair_attempts}R)"
         if row.thermal_bloat:
             return "🟡 BLOAT"
         return "🟢 INTACT"
@@ -177,8 +197,119 @@ def _avg_retention_fraction(turns: list[TurnRecord]) -> float:
     return sum(fractions) / len(fractions)
 
 
+def _turn_bsfc_bloat(input_tokens: int, output_tokens: int, *, schema_sql: str | None = None) -> bool:
+    artifact_chars = max(len(schema_sql or ""), max(output_tokens, 0) * 4, 1)
+    io_ratio = input_tokens / max(output_tokens, 1)
+    char_bloat = input_tokens > (50 * artifact_chars)
+    return char_bloat or (
+        input_tokens > QUADRATIC_BLOAT_INPUT_MIN and io_ratio > QUADRATIC_BLOAT_IO_RATIO
+    )
+
+
+def _refresh_turn_bsfc_flags(sheet: DynoRunSheet) -> None:
+    """Recompute per-turn BSFC multiplier and bloat flags (for rescoring saved sheets)."""
+    for row in sheet.turns:
+        out = max(row.output_tokens, 0)
+        artifact_tokens = max(out, 1)
+        row.token_multiplier = row.input_tokens / artifact_tokens
+        row.thermal_bloat = _turn_bsfc_bloat(row.input_tokens, row.output_tokens)
+
+
+def _compute_bsfc_aggregate(sheet: DynoRunSheet) -> dict[str, float | int]:
+    turns = sheet.turns
+    if not turns:
+        return {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "yield_ratio": 0.0,
+            "avg_bsfc": 0.0,
+            "peak_bsfc": 0.0,
+            "bloat_turns": 0,
+            "bloat_frac": 0.0,
+        }
+    total_in = sum(t.input_tokens for t in turns)
+    total_out = sum(t.output_tokens for t in turns)
+    bsfc_values = [t.input_tokens / max(t.output_tokens, 1) for t in turns]
+    bloat_turns = sum(1 for t in turns if t.thermal_bloat)
+    return {
+        "total_input_tokens": total_in,
+        "total_output_tokens": total_out,
+        "yield_ratio": total_out / max(total_in, 1),
+        "avg_bsfc": sum(bsfc_values) / len(bsfc_values),
+        "peak_bsfc": max(bsfc_values),
+        "bloat_turns": bloat_turns,
+        "bloat_frac": bloat_turns / len(turns),
+    }
+
+
+def _pre_failure_token_base(sheet: DynoRunSheet) -> int:
+    """Tokens burned before first unassisted drop (attempt 0 only on drop turn)."""
+    _, _, _, _, _, first_drop = _recovery_totals(sheet)
+    if first_drop is None:
+        return sum(t.input_tokens + t.output_tokens for t in sheet.turns)
+    total = 0
+    for row in sheet.turns:
+        if row.turn < first_drop:
+            total += row.input_tokens + row.output_tokens
+        elif row.turn == first_drop:
+            total += row.input_tokens + row.output_tokens - row.recovery_tokens
+            break
+    return max(total, 1)
+
+
+def _post_failure_runaway_tokens(sheet: DynoRunSheet) -> int:
+    """All tokens burned on/after first drop, excluding explicit recovery overhead tally."""
+    _, _, total_recovery, _, _, first_drop = _recovery_totals(sheet)
+    if first_drop is None:
+        return 0
+    post = 0
+    for row in sheet.turns:
+        if row.turn >= first_drop:
+            post += row.input_tokens + row.output_tokens
+    return max(0, post - total_recovery)
+
+
+def _recovery_totals(sheet: DynoRunSheet) -> tuple[int, int, int, int, int, int | None]:
+    """Return (total_retries, total_cascading, total_recovery_tokens, clean_recoveries, turns_with_failures, first_unassisted_drop)."""
+    turns = sheet.turns
+    total_retries = sum(t.repair_attempts for t in turns)
+    total_cascading = sum(t.cascading_regressions for t in turns)
+    total_recovery_tokens = sum(t.recovery_tokens for t in turns)
+    clean_recoveries = sum(1 for t in turns if t.recovered_cleanly)
+    turns_with_failures = sum(
+        1 for t in turns if t.repair_attempts > 0 or not t.invariant_intact or t.initial_failed_invariants
+    )
+    first_unassisted_drop: int | None = None
+    for t in turns:
+        if t.repair_attempts > 0 or not t.invariant_intact or t.initial_failed_invariants:
+            first_unassisted_drop = t.turn
+            break
+    return (
+        total_retries,
+        total_cascading,
+        total_recovery_tokens,
+        clean_recoveries,
+        turns_with_failures,
+        first_unassisted_drop,
+    )
+
+
+def _multiplier_to_thermal_grade(mult: float) -> str:
+    if mult >= 1.03:
+        return "A+"
+    if mult >= 0.95:
+        return "A"
+    if mult >= 0.82:
+        return "B"
+    if mult >= 0.65:
+        return "C"
+    if mult >= 0.45:
+        return "D"
+    return "F"
+
+
 def compute_structural_torque(sheet: DynoRunSheet) -> int:
-    """PolyScore structural torque (0–1000), scaled by Eddy-Current load stage."""
+    """PolyScore structural torque (0–1000), scaled by Eddy-Current load stage and anti-dilution penalties."""
     turns = sheet.turns
     if not turns:
         return 0
@@ -186,54 +317,157 @@ def compute_structural_torque(sheet: DynoRunSheet) -> int:
     if load in ("standard", "adversarial"):
         load = "stage1" if load == "standard" else "stage2"
     multiplier = LOAD_TORQUE_MULTIPLIER.get(load, 0.7)
-    intact = sum(1 for row in turns if row.invariant_intact)
     benchmark_turns = max(len(TURN_SPECS), 1)
-    turn_factor = intact / benchmark_turns
     retention = _avg_retention_fraction(turns)
-    score = 1000.0 * multiplier * turn_factor * retention
-    return max(0, min(1000, int(round(score))))
+
+    total_retries, total_cascading, total_recovery_tokens, _, _, _ = _recovery_totals(sheet)
+    # Zero-Retry Guard: 100% untouched formula when no retries/regressions/recovery tokens
+    if total_retries == 0 and total_cascading == 0 and total_recovery_tokens == 0:
+        intact = sum(1 for row in turns if row.invariant_intact)
+        turn_factor = intact / benchmark_turns
+        score = 1000.0 * multiplier * turn_factor * retention
+        return max(0, min(1000, int(round(score))))
+
+    # Anti-Dilution Scoring: turns requiring repair or completed after the first repair earn 25% gross structural weight
+    first_repair_turn = next(
+        (row.turn for row in turns if row.repair_attempts > 0 or row.initial_failed_invariants),
+        None,
+    )
+    weighted_intact = 0.0
+    for row in turns:
+        if not row.invariant_intact:
+            continue
+        if first_repair_turn is not None and row.turn >= first_repair_turn:
+            weighted_intact += 0.25
+        else:
+            weighted_intact += 1.0
+
+    total_input = sum(row.input_tokens for row in turns)
+    strict_context_runaway = total_input > LEAN_RUN_INPUT_BUDGET
+
+    if strict_context_runaway:
+        run_benchmark = max(min(len(turns), benchmark_turns), 1)
+        gross_torque = int(
+            round(1000.0 * multiplier * (weighted_intact / run_benchmark) * retention)
+        )
+    else:
+        intact_count = sum(1 for row in turns if row.invariant_intact)
+        unassisted_equiv_torque = 1000.0 * (weighted_intact / benchmark_turns) * retention
+        full_track_gross_torque = 1000.0 * multiplier * (intact_count / benchmark_turns) * retention
+        gross_torque = int(round((full_track_gross_torque * 0.5) + (unassisted_equiv_torque * 0.6)))
+
+    retry_tax = total_retries * 15
+    regression_penalty = total_cascading * 45
+    net_torque = max(0, gross_torque - retry_tax - regression_penalty)
+    return max(0, min(1000, net_torque))
+
+
+def compute_effective_thermal(sheet: DynoRunSheet) -> tuple[str, float]:
+    """Return (thermal_grade, effective_thermal_multiplier) with recovery token overhead penalty."""
+    base_grade = compute_thermal_grade(sheet)
+    base_mult = thermal_grade_multiplier(base_grade)
+    total_retries, total_cascading, total_recovery_tokens, _, _, _ = _recovery_totals(sheet)
+    if total_retries == 0 and total_cascading == 0 and total_recovery_tokens == 0:
+        return base_grade, base_mult
+
+    total_in = sum(row.input_tokens for row in sheet.turns)
+    if total_in > LEAN_RUN_INPUT_BUDGET:
+        pre_failure_base = min(_pre_failure_token_base(sheet), PRE_FAILURE_TOKEN_CAP)
+        recovery_overhead_ratio = total_recovery_tokens / max(pre_failure_base, 1)
+    else:
+        turns = sheet.turns
+        total_tokens = sum(row.input_tokens + row.output_tokens for row in turns)
+        base_turn_tokens = max(1, total_tokens - total_recovery_tokens)
+        recovery_overhead_ratio = total_recovery_tokens / base_turn_tokens
+    penalized_mult = max(
+        EFFECTIVE_THERMAL_FLOOR,
+        base_mult - (recovery_overhead_ratio * RECOVERY_PENALTY_COEFFICIENT),
+    )
+    penalized_grade = _multiplier_to_thermal_grade(penalized_mult)
+    return penalized_grade, penalized_mult
 
 
 def compute_thermal_grade(sheet: DynoRunSheet) -> str:
-    """PolyScore thermal letter grade from useful output vs. context bloat."""
+    """PolyScore thermal letter grade from BSFC / cumulative token burn."""
     turns = sheet.turns
     if not turns:
         return "F"
-    total_in = sum(row.input_tokens for row in turns)
-    total_out = sum(row.output_tokens for row in turns)
-    yield_ratio = total_out / max(total_in, 1)
+    agg = _compute_bsfc_aggregate(sheet)
+    total_in = int(agg["total_input_tokens"])
+    yield_ratio = float(agg["yield_ratio"])
+    bloat_frac = float(agg["bloat_frac"])
     avg_eff = sum(row.thermal_efficiency_ratio for row in turns) / len(turns)
-    bloat_turns = sum(1 for row in turns if row.thermal_bloat)
-    bloat_frac = bloat_turns / len(turns)
 
-    if bloat_frac >= 0.5 or yield_ratio < 0.005:
+    if yield_ratio < 0.025 or bloat_frac >= 0.55:
         return "F"
-    if bloat_frac >= 0.25 or yield_ratio < 0.01:
+    if total_in > CONTEXT_RUNAWAY_INPUT_CAP or yield_ratio < 0.035 or bloat_frac >= 0.45:
         return "D"
-    if bloat_frac >= 0.12 or yield_ratio < 0.02 or avg_eff < 0.025:
+    if total_in > LEAN_RUN_INPUT_BUDGET or yield_ratio < 0.042 or bloat_frac >= 0.30:
         return "C"
-    if bloat_frac >= 0.05 or yield_ratio < 0.035 or avg_eff < 0.045:
+    if total_in > 450_000 or yield_ratio < 0.05 or bloat_frac >= 0.15:
         return "B"
-    if bloat_frac == 0 and yield_ratio >= 0.06 and avg_eff >= 0.06:
+    if total_in <= 150_000 and bloat_frac < 0.05 and yield_ratio >= 0.06 and avg_eff >= 0.06:
         return "A+"
-    return "A"
+    if total_in <= LEAN_RUN_INPUT_BUDGET and yield_ratio >= 0.05:
+        return "A"
+    return "B"
 
 
 def thermal_grade_multiplier(thermal_grade: str) -> float:
     return THERMAL_GRADE_MULTIPLIER.get(thermal_grade, THERMAL_GRADE_MULTIPLIER["F"])
 
 
-def calculate_polyscore(structural_torque: int, thermal_grade: str) -> int:
+def calculate_polyscore(
+    structural_torque: int,
+    thermal_grade: str,
+    *,
+    thermal_multiplier_override: float | None = None,
+) -> int:
     """Headline PolyScore (0–1000): structural torque adjusted by thermal grade."""
-    multiplier = thermal_grade_multiplier(thermal_grade)
+    multiplier = (
+        thermal_multiplier_override
+        if thermal_multiplier_override is not None
+        else thermal_grade_multiplier(thermal_grade)
+    )
     raw = round(structural_torque * multiplier)
     return max(0, min(1000, raw))
 
 
 def finalize_polyscore(sheet: DynoRunSheet) -> None:
+    _refresh_turn_bsfc_flags(sheet)
+    agg = _compute_bsfc_aggregate(sheet)
+    pre_failure = _pre_failure_token_base(sheet)
+    post_failure = _post_failure_runaway_tokens(sheet)
+    total_retries, _, total_recovery, _, _, first_drop = _recovery_totals(sheet)
+    sheet.metadata["bsfc_avg"] = round(float(agg["avg_bsfc"]), 2)
+    sheet.metadata["bsfc_peak"] = round(float(agg["peak_bsfc"]), 2)
+    sheet.metadata["yield_ratio"] = round(float(agg["yield_ratio"]), 4)
+    sheet.metadata["bloat_turns"] = int(agg["bloat_turns"])
+    sheet.metadata["pre_failure_tokens"] = pre_failure
+    sheet.metadata["post_failure_runaway_tokens"] = post_failure
+    if first_drop is not None and pre_failure > 0:
+        sheet.metadata["context_runaway_factor"] = round(
+            int(agg["total_input_tokens"]) / pre_failure,
+            2,
+        )
+    recovery_anchor = min(pre_failure, PRE_FAILURE_TOKEN_CAP)
+    if total_recovery > 0 and recovery_anchor > 0:
+        sheet.metadata["recovery_overhead_vs_predrop_pct"] = round(
+            100.0 * total_recovery / recovery_anchor,
+            1,
+        )
+
     sheet.structural_torque = compute_structural_torque(sheet)
-    sheet.thermal_grade = compute_thermal_grade(sheet)
-    sheet.polyscore = calculate_polyscore(sheet.structural_torque, sheet.thermal_grade)
+    base_grade = compute_thermal_grade(sheet)
+    grade, effective_mult = compute_effective_thermal(sheet)
+    sheet.thermal_grade = grade
+    sheet.metadata["base_thermal_grade"] = base_grade
+    sheet.metadata["effective_thermal_multiplier"] = round(effective_mult, 4)
+    sheet.polyscore = calculate_polyscore(
+        sheet.structural_torque,
+        sheet.thermal_grade,
+        thermal_multiplier_override=effective_mult,
+    )
 
 
 def workload_verification_badge(sheet: DynoRunSheet) -> str:
@@ -284,12 +518,17 @@ def _sheet_summary_row(label: str, sheet: DynoRunSheet) -> dict[str, str]:
     torque = sheet.structural_torque
     if torque is None:
         torque = compute_structural_torque(sheet)
-    grade = sheet.thermal_grade or compute_thermal_grade(sheet)
-    thermal_mult = thermal_grade_multiplier(grade)
+    eff_grade, eff_mult = compute_effective_thermal(sheet)
+    grade = sheet.thermal_grade or eff_grade
+    thermal_mult = float(sheet.metadata.get("effective_thermal_multiplier", eff_mult))
     score = sheet.polyscore
     if score is None:
-        score = calculate_polyscore(torque, grade)
+        score = calculate_polyscore(torque, grade, thermal_multiplier_override=thermal_mult)
     w_hash = sheet.workload_verification_hash or "n/a"
+    invariant_mode = str(sheet.metadata.get("invariant_mode", "baseline"))
+    total_retries, total_cascading, total_recovery_tokens, clean_recoveries, turns_with_failures, first_drop = _recovery_totals(sheet)
+    base_tokens = max(1, (total_in + total_out) - total_recovery_tokens)
+    overhead_pct = (total_recovery_tokens / base_tokens) * 100.0 if total_recovery_tokens > 0 else 0.0
     return {
         "label": label,
         "model": f"{sheet.provider}/{sheet.model}",
@@ -303,7 +542,13 @@ def _sheet_summary_row(label: str, sheet: DynoRunSheet) -> dict[str, str]:
         "turns": str(len(turns)),
         "load": str(load_stage),
         "profile": str(load_stage),
+        "invariant_mode": invariant_mode,
         "drift_turn": str(drift) if drift else "none",
+        "first_unassisted_drop": str(first_drop) if first_drop else "none",
+        "total_retries": str(total_retries),
+        "recovery_tokens": f"+{total_recovery_tokens:,} ({overhead_pct:.1f}%)",
+        "clean_recoveries": f"{clean_recoveries}/{turns_with_failures}",
+        "cascading_regressions": str(total_cascading),
         "pass_rate": f"{intact}/{len(turns)}" if turns else "0/0",
         "input_tokens": f"{total_in:,}",
         "cached_input_tokens": f"{total_cached:,}",
@@ -351,21 +596,28 @@ def _cta_footer_markdown() -> str:
 
 def _telemetry_table_markdown(sheet: DynoRunSheet) -> str:
     header = (
-        "| Turn | Input | Output | Cached In | Retention | Cost | Status |\n"
-        "| ---: | ---: | ---: | ---: | :---: | ---: | :---: |"
+        "| Turn | Input | Output | Cached In | Retries | Recov Tok | Cascading | Retention | Cost | Status |\n"
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :---: |"
     )
     rows: list[str] = []
     for t in sheet.turns:
         if t.status == "API_ERROR":
             status = "API_ERROR"
         elif not t.invariant_intact:
-            status = "DRIFT"
+            status = f"DRIFT ({t.repair_attempts}R)" if t.repair_attempts > 0 else "DRIFT"
+        elif t.repair_attempts > 0:
+            status = (
+                f"REPAIRED ({t.repair_attempts}R/{t.cascading_regressions}C)"
+                if t.cascading_regressions > 0
+                else f"REPAIRED ({t.repair_attempts}R)"
+            )
         elif t.thermal_bloat:
             status = "BLOAT"
         else:
             status = "INTACT"
         rows.append(
             f"| {t.turn} | {t.input_tokens:,} | {t.output_tokens:,} | {t.cached_input_tokens:,} "
+            f"| {t.repair_attempts} | {t.recovery_tokens:,} | {t.cascading_regressions} "
             f"| {t.retention_score} | ${t.cumulative_cost_usd:.4f} | {status} |"
         )
     return header + "\n" + "\n".join(rows)
@@ -377,16 +629,22 @@ def _kpi_block_markdown(row: dict[str, str]) -> str:
         ### PolyScore — {row["label"]}
 
         - **PolyScore:** **{row["polyscore"]}** / 1000
-        - **Breakdown:** Torque {row["structural_torque"]}/1000 · Thermal {row["thermal_grade"]} (×{row["thermal_multiplier"]}) · Load `{row["load"]}`
+        - **Breakdown:** Torque {row["structural_torque"]}/1000 · Thermal {row["thermal_grade"]} (×{row["thermal_multiplier"]}) · Load `{row["load"]}` · Mode `{row["invariant_mode"]}`
         - **Workload verification:** `{row["workload_hash"]}`
 
         ### KPI summary — {row["label"]}
 
         - **Model:** `{row["model"]}`
         - **Eddy-Current load:** `{row["load"]}`
+        - **Invariant mode:** `{row["invariant_mode"]}`
         - **Turns completed:** {row["turns"]}
         - **Invariant pass rate:** {row["pass_rate"]}
-        - **First drift turn:** {row["drift_turn"]}
+        - **First unassisted drop:** {row["first_unassisted_drop"]}
+        - **Terminal drift turn:** {row["drift_turn"]}
+        - **Total repair retries:** {row["total_retries"]}
+        - **Recovery token overhead:** {row["recovery_tokens"]}
+        - **Clean recoveries:** {row["clean_recoveries"]}
+        - **Cascading regressions:** {row["cascading_regressions"]}
         - **Total input tokens:** {row["input_tokens"]}
         - **Cached input tokens:** {row["cached_input_tokens"]}
         - **Total output tokens:** {row["output_tokens"]}
@@ -430,8 +688,12 @@ def export_markdown_report(
     compare_sheet: DynoRunSheet | None = None,
 ) -> Path:
     """Export GitHub-flavored Markdown dyno report for one run (optional head-to-head compare)."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = Path(results_dir) / f"dyno_report_{stamp}.md"
+    out_root = Path(results_dir)
+    if out_root.suffix.lower() == ".md":
+        out_path = out_root
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_path = out_root / f"dyno_report_{stamp}.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     row = _sheet_summary_row("Run", sheet)
@@ -480,8 +742,14 @@ def export_markdown_report(
                 "| --- | --- | --- |",
                 f"| Model | `{row['model']}` | `{row_b['model']}` |",
                 f"| Load | `{row['load']}` | `{row_b['load']}` |",
+                f"| Invariant mode | `{row['invariant_mode']}` | `{row_b['invariant_mode']}` |",
+                f"| PolyScore | **{row['polyscore']}** | **{row_b['polyscore']}** |",
                 f"| Turns | {row['turns']} | {row_b['turns']} |",
-                f"| Drift turn | {row['drift_turn']} | {row_b['drift_turn']} |",
+                f"| First unassisted drop | {row['first_unassisted_drop']} | {row_b['first_unassisted_drop']} |",
+                f"| Terminal drift turn | {row['drift_turn']} | {row_b['drift_turn']} |",
+                f"| Repair retries | {row['total_retries']} | {row_b['total_retries']} |",
+                f"| Cascading regressions | {row['cascading_regressions']} | {row_b['cascading_regressions']} |",
+                f"| Recovery overhead | {row['recovery_tokens']} | {row_b['recovery_tokens']} |",
                 f"| Input tokens | {row['input_tokens']} | {row_b['input_tokens']} |",
                 f"| Final cost | {row['final_cost']} | {row_b['final_cost']} |",
                 "",
@@ -531,12 +799,21 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
     summary.add_column("Value", justify="right", no_wrap=True)
     load_stage = sheet.metadata.get("load", sheet.metadata.get("profile", "n/a"))
     avg_eff = sum(t.thermal_efficiency_ratio for t in turns) / len(turns)
-    avg_mult = sum(t.token_multiplier for t in turns) / len(turns)
-    bloat_turns = sum(1 for t in turns if t.thermal_bloat)
+    _refresh_turn_bsfc_flags(sheet)
+    agg = _compute_bsfc_aggregate(sheet)
+    avg_bsfc = float(agg["avg_bsfc"])
+    peak_bsfc = float(agg["peak_bsfc"])
+    yield_ratio = float(agg["yield_ratio"])
+    bloat_turns = int(agg["bloat_turns"])
     torque = sheet.structural_torque if sheet.structural_torque is not None else compute_structural_torque(sheet)
-    grade = sheet.thermal_grade or compute_thermal_grade(sheet)
-    thermal_mult = thermal_grade_multiplier(grade)
-    score = sheet.polyscore if sheet.polyscore is not None else calculate_polyscore(torque, grade)
+    eff_grade, eff_mult = compute_effective_thermal(sheet)
+    grade = sheet.thermal_grade or eff_grade
+    thermal_mult = float(sheet.metadata.get("effective_thermal_multiplier", eff_mult))
+    score = (
+        sheet.polyscore
+        if sheet.polyscore is not None
+        else calculate_polyscore(torque, grade, thermal_multiplier_override=thermal_mult)
+    )
     verify_badge = workload_verification_badge(sheet)
 
     hero = Text()
@@ -555,9 +832,16 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
     summary.add_row("Eddy-Current load", str(load_stage))
     summary.add_row("Provider / Model", f"{sheet.provider} / {sheet.model}")
     summary.add_row("Turns completed", str(len(turns)))
+    summary.add_row("Effective yield (out/in)", f"{yield_ratio:.1%}")
+    summary.add_row("BSFC token bloat (in/out)", f"{avg_bsfc:.1f}x avg (peak {peak_bsfc:.1f}x)")
     summary.add_row("Avg thermal efficiency", f"{avg_eff:.4f}")
-    summary.add_row("Avg token multiplier", f"{avg_mult:.1f}x")
     summary.add_row("Thermal bloat turns", str(bloat_turns))
+    runaway = sheet.metadata.get("context_runaway_factor")
+    if runaway is not None:
+        summary.add_row("Context runaway vs pre-drop", f"{runaway:.1f}x total input")
+    post_fail = sheet.metadata.get("post_failure_runaway_tokens")
+    if post_fail:
+        summary.add_row("Post-failure token burn", f"{int(post_fail):,} tokens")
     summary.add_row("Invariant intact rate", f"{intact_count}/{len(turns)}")
     summary.add_row("First drift turn", str(first_drift) if first_drift else "none")
     summary.add_row("Total input tokens", f"{total_input:,}")
@@ -565,6 +849,76 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
     summary.add_row("Total output tokens", f"{total_output:,}")
     summary.add_row("Total latency (ms)", f"{total_latency:,.1f}")
     summary.add_row("Final cumulative cost (USD)", f"${final_cost:.4f}")
+
+    invariant_mode = str(sheet.metadata.get("invariant_mode", "baseline"))
+    max_retries_cfg = int(sheet.metadata.get("max_retries", 0) or 0)
+    (
+        total_retries,
+        total_cascading,
+        total_recovery_tokens,
+        clean_recoveries,
+        turns_with_failures,
+        first_unassisted_drop,
+    ) = _recovery_totals(sheet)
+    recovery_anchor = min(_pre_failure_token_base(sheet), PRE_FAILURE_TOKEN_CAP)
+    overhead_pct = (
+        (total_recovery_tokens / recovery_anchor) * 100.0
+        if total_recovery_tokens > 0 and recovery_anchor > 0
+        else 0.0
+    )
+    thermal_penalty_pct = overhead_pct * RECOVERY_PENALTY_COEFFICIENT
+    base_thermal = str(sheet.metadata.get("base_thermal_grade", grade))
+    retry_and_regression_tax = (total_retries * 15) + (total_cascading * 45)
+
+    containment = Table(
+        title="POST-FAILURE CONTAINMENT & RECOVERY",
+        box=box.ROUNDED,
+        expand=False,
+    )
+    containment.add_column("Metric", style="bold", no_wrap=True)
+    containment.add_column("Value", justify="right", no_wrap=True)
+    if invariant_mode == "baseline" and max_retries_cfg == 0 and total_retries == 0:
+        containment.add_row("Invariant Mode", "baseline")
+        containment.add_row("Self-Repair Status", "N/A (Unassisted Baseline)")
+        containment.add_row(
+            "First Unassisted Drop",
+            f"Turn {first_unassisted_drop}" if first_unassisted_drop else "none",
+        )
+        containment.add_row(
+            "Terminal Drift Turn",
+            f"Turn {first_drift}" if first_drift else "none",
+        )
+    else:
+        containment.add_row("Invariant Mode", invariant_mode)
+        containment.add_row(
+            "First Unassisted Drop",
+            f"Turn {first_unassisted_drop}" if first_unassisted_drop else "none",
+        )
+        containment.add_row(
+            "Terminal Drift Turn",
+            f"Turn {first_drift}" if first_drift else "none",
+        )
+        containment.add_row("Total Repair Retries", str(total_retries))
+        containment.add_row(
+            "Recovery Token Overhead",
+            f"+{total_recovery_tokens:,} tokens (+{overhead_pct:.1f}% vs pre-drop · -{thermal_penalty_pct:.1f}% thermal mult)",
+        )
+        containment.add_row(
+            "Thermal grade (base → effective)",
+            f"{base_thermal} → {grade} [x{thermal_mult:.2f}]",
+        )
+        containment.add_row(
+            "Clean Recoveries",
+            f"{clean_recoveries} / {turns_with_failures}",
+        )
+        containment.add_row(
+            "Cascading Regressions",
+            f"{total_cascading} (Secondary invariants broken)",
+        )
+        containment.add_row(
+            "Retry & Regression Tax",
+            f"-{retry_and_regression_tax} pts ({total_retries} retries, {total_cascading} cascading breaks)",
+        )
 
     drift_line = Text()
     if first_drift:
@@ -586,7 +940,7 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
         padding=(0, 1),
     )
 
-    parts: list[RenderableType] = [polyscore_hero, summary, spark_panel, drift_line]
+    parts: list[RenderableType] = [polyscore_hero, summary, containment, spark_panel, drift_line]
     first_drift_row = next((t for t in turns if not t.invariant_intact), None)
     if first_drift_row is not None:
         parts.append(
@@ -610,6 +964,9 @@ def export_html_dyno_chart(
     turns = sheet.turns
     labels = [str(t.turn) for t in turns]
     input_tokens = [t.input_tokens for t in turns]
+    recovery_tokens_series = [t.recovery_tokens for t in turns]
+    repair_attempts_series = [t.repair_attempts for t in turns]
+    cascading_series = [t.cascading_regressions for t in turns]
     costs = [t.cumulative_cost_usd for t in turns]
     retention_pct = []
     for t in turns:
@@ -623,15 +980,44 @@ def export_html_dyno_chart(
     final_cost = turns[-1].cumulative_cost_usd if turns else 0.0
     pass_rate = f"{intact}/{len(turns)}" if turns else "0/0"
     load_stage = sheet.metadata.get("load", sheet.metadata.get("profile", "n/a"))
+    invariant_mode = str(sheet.metadata.get("invariant_mode", "baseline"))
+    (
+        total_retries,
+        total_cascading,
+        total_recovery_tokens,
+        clean_recoveries,
+        turns_with_failures,
+        first_unassisted_drop,
+    ) = _recovery_totals(sheet)
+    _refresh_turn_bsfc_flags(sheet)
+    agg = _compute_bsfc_aggregate(sheet)
+    recovery_anchor = min(_pre_failure_token_base(sheet), PRE_FAILURE_TOKEN_CAP)
+    overhead_pct = (
+        (total_recovery_tokens / recovery_anchor) * 100.0
+        if total_recovery_tokens > 0 and recovery_anchor > 0
+        else 0.0
+    )
+    thermal_penalty_pct = overhead_pct * RECOVERY_PENALTY_COEFFICIENT
+    retry_and_regression_tax = (total_retries * 15) + (total_cascading * 45)
     avg_eff = sum(t.thermal_efficiency_ratio for t in turns) / len(turns) if turns else 0.0
-    avg_mult = sum(t.token_multiplier for t in turns) / len(turns) if turns else 0.0
-    bloat_turns = sum(1 for t in turns if t.thermal_bloat)
+    avg_bsfc = float(agg["avg_bsfc"])
+    peak_bsfc = float(agg["peak_bsfc"])
+    yield_ratio = float(agg["yield_ratio"])
+    bloat_turns = int(agg["bloat_turns"])
+    runaway = sheet.metadata.get("context_runaway_factor")
+    post_fail_tokens = int(sheet.metadata.get("post_failure_runaway_tokens") or 0)
     torque = sheet.structural_torque if sheet.structural_torque is not None else compute_structural_torque(sheet)
-    grade = sheet.thermal_grade or compute_thermal_grade(sheet)
-    thermal_mult = thermal_grade_multiplier(grade)
-    score = sheet.polyscore if sheet.polyscore is not None else calculate_polyscore(torque, grade)
+    eff_grade, eff_mult = compute_effective_thermal(sheet)
+    grade = sheet.thermal_grade or eff_grade
+    base_thermal = str(sheet.metadata.get("base_thermal_grade", grade))
+    thermal_mult = float(sheet.metadata.get("effective_thermal_multiplier", eff_mult))
+    score = (
+        sheet.polyscore
+        if sheet.polyscore is not None
+        else calculate_polyscore(torque, grade, thermal_multiplier_override=thermal_mult)
+    )
     verify_badge = workload_verification_badge(sheet)
-    hero_subtext = f"Torque {torque} · Thermal {grade} ({thermal_mult:.2f}x) · Load {load_stage}"
+    hero_subtext = f"Torque {torque} · Thermal {grade} ({thermal_mult:.2f}x) · Load {load_stage} · Mode {invariant_mode}"
 
     drift_turn_js = "null" if drift_turn is None else str(drift_turn)
 
@@ -642,8 +1028,12 @@ def export_html_dyno_chart(
 
         noise_html = escape(sheet.autopsy.adversarial_context_noise)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = Path(results_dir) / f"dyno_chart_{stamp}.html"
+    out_root = Path(results_dir)
+    if out_root.suffix.lower() == ".html":
+        out_path = out_root
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_path = out_root / f"dyno_chart_{stamp}.html"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     html_doc = f"""<!DOCTYPE html>
@@ -763,11 +1153,18 @@ def export_html_dyno_chart(
         <span class="verify">{verify_badge}</span>
       </div>
       <div class="kpi"><label>Load Stage</label><strong>{load_stage}</strong></div>
+      <div class="kpi"><label>Invariant Mode</label><strong>{invariant_mode}</strong></div>
       <div class="kpi"><label>Model</label><strong>{sheet.provider}/{sheet.model}</strong></div>
-      <div class="kpi"><label>First Drift Turn</label><strong>{drift_turn if drift_turn else "none"}</strong></div>
-      <div class="kpi"><label>Thermal Efficiency</label><strong>{avg_eff:.4f}</strong></div>
-      <div class="kpi"><label>Token Multiplier</label><strong>{avg_mult:.1f}x</strong></div>
+      <div class="kpi"><label>First Unassisted Drop</label><strong>{f"Turn {first_unassisted_drop}" if first_unassisted_drop else "none"}</strong></div>
+      <div class="kpi"><label>Terminal Drift Turn</label><strong>{f"Turn {drift_turn}" if drift_turn else "none"}</strong></div>
+      <div class="kpi"><label>Total Repair Retries</label><strong>{total_retries} ({clean_recoveries}/{turns_with_failures} clean)</strong></div>
+      <div class="kpi"><label>Cascading Regressions</label><strong>{total_cascading}</strong></div>
+      <div class="kpi"><label>Retry &amp; Regression Tax</label><strong>-{retry_and_regression_tax} pts ({total_retries} retries, {total_cascading} cascading breaks)</strong></div>
+      <div class="kpi"><label>BSFC Token Bloat (in/out)</label><strong>{avg_bsfc:.1f}x avg · peak {peak_bsfc:.1f}x · yield {yield_ratio:.1%}</strong></div>
+      <div class="kpi"><label>Context Runaway</label><strong>{f"{runaway:.1f}x vs pre-drop" if runaway is not None else "n/a"} · {post_fail_tokens:,} post-failure tok</strong></div>
+      <div class="kpi"><label>Recovery Token Overhead</label><strong>+{total_recovery_tokens:,} tok (+{overhead_pct:.1f}% vs pre-drop → {base_thermal}→{grade} x{thermal_mult:.2f})</strong></div>
       <div class="kpi"><label>Thermal Bloat Turns</label><strong>{bloat_turns}</strong></div>
+      <div class="kpi"><label>Thermal Efficiency</label><strong>{avg_eff:.4f}</strong></div>
       <div class="kpi"><label>Total Tokens (in+out)</label><strong>{total_input + total_output:,}</strong></div>
       <div class="kpi"><label>Total Cost</label><strong>${final_cost:.4f}</strong></div>
       <div class="kpi"><label>Invariant Pass Rate</label><strong>{pass_rate}</strong></div>
@@ -788,28 +1185,58 @@ def export_html_dyno_chart(
   <script>
     const labels = {labels!r};
     const inputTokens = {input_tokens!r};
+    const recoveryTokens = {recovery_tokens_series!r};
+    const repairAttempts = {repair_attempts_series!r};
+    const cascadingBreaks = {cascading_series!r};
     const costs = {costs!r};
     const retentionPct = {retention_pct!r};
     const driftTurn = {drift_turn_js};
+    const pointColors = labels.map((_, idx) => {{
+      if (cascadingBreaks[idx] > 0) return '#ff4d4f';
+      if (repairAttempts[idx] > 0) return '#f0883e';
+      return '#58a6ff';
+    }});
+    const pointRadii = labels.map((_, idx) => (repairAttempts[idx] > 0 || cascadingBreaks[idx] > 0 ? 7 : 3));
     const driftCliffPlugin = {{
       id: 'driftCliff',
       afterDraw(chart) {{
-        if (driftTurn === null) return;
-        const idx = labels.indexOf(String(driftTurn));
-        if (idx < 0) return;
-        const x = chart.scales.x.getPixelForValue(labels[idx]);
         const {{ top, bottom }} = chart.chartArea;
         const ctx2 = chart.ctx;
         ctx2.save();
-        ctx2.strokeStyle = '#ff4d4f';
-        ctx2.lineWidth = 3;
-        ctx2.beginPath();
-        ctx2.moveTo(x, top);
-        ctx2.lineTo(x, bottom);
-        ctx2.stroke();
-        ctx2.fillStyle = '#ff4d4f';
-        ctx2.font = '12px sans-serif';
-        ctx2.fillText('Drift Cliff T' + driftTurn, x + 6, top + 14);
+        labels.forEach((lbl, idx) => {{
+          if (repairAttempts[idx] > 0) {{
+            const rx = chart.scales.x.getPixelForValue(lbl);
+            ctx2.strokeStyle = cascadingBreaks[idx] > 0 ? 'rgba(255,77,79,0.55)' : 'rgba(240,136,62,0.55)';
+            ctx2.lineWidth = 2;
+            ctx2.setLineDash([4, 4]);
+            ctx2.beginPath();
+            ctx2.moveTo(rx, top);
+            ctx2.lineTo(rx, bottom);
+            ctx2.stroke();
+            ctx2.setLineDash([]);
+            ctx2.fillStyle = cascadingBreaks[idx] > 0 ? '#ff7b72' : '#f0883e';
+            ctx2.font = '11px sans-serif';
+            const tag = cascadingBreaks[idx] > 0
+              ? `T${{lbl}}: ${{repairAttempts[idx]}}R / ${{cascadingBreaks[idx]}}C`
+              : `T${{lbl}}: ${{repairAttempts[idx]}}R clean`;
+            ctx2.fillText(tag, rx + 4, top + 28);
+          }}
+        }});
+        if (driftTurn !== null) {{
+          const idx = labels.indexOf(String(driftTurn));
+          if (idx >= 0) {{
+            const x = chart.scales.x.getPixelForValue(labels[idx]);
+            ctx2.strokeStyle = '#ff4d4f';
+            ctx2.lineWidth = 3;
+            ctx2.beginPath();
+            ctx2.moveTo(x, top);
+            ctx2.lineTo(x, bottom);
+            ctx2.stroke();
+            ctx2.fillStyle = '#ff4d4f';
+            ctx2.font = '12px sans-serif';
+            ctx2.fillText('Drift Cliff T' + driftTurn, x + 6, top + 14);
+          }}
+        }}
         ctx2.restore();
       }},
     }};
@@ -825,8 +1252,19 @@ def export_html_dyno_chart(
             data: inputTokens,
             borderColor: '#58a6ff',
             backgroundColor: 'rgba(88,166,255,0.15)',
+            pointBackgroundColor: pointColors,
+            pointBorderColor: pointColors,
+            pointRadius: pointRadii,
             yAxisID: 'y',
             tension: 0.2,
+          }},
+          {{
+            type: 'bar',
+            label: 'Recovery Tokens (Self-Repair)',
+            data: recoveryTokens,
+            borderColor: '#f0883e',
+            backgroundColor: 'rgba(240,136,62,0.45)',
+            yAxisID: 'y',
           }},
           {{
             label: 'Cumulative Cost ($)',

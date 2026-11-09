@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from textwrap import dedent
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field
 
 LoadStage = Literal["stage1", "stage2", "outlaw"]
 LoadProfile = Literal["standard", "adversarial"]  # legacy alias
+InvariantMode = Literal["baseline", "prose-repeat", "ledger", "verify-commit"]
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -400,22 +401,106 @@ def generate_simulated_python(turn: int) -> str:
     ).strip()
 
 
-def _apply_retention_stubs(base_sql: str, turn: int) -> str:
+def format_invariant_reminder(
+    invariant_mode: InvariantMode,
+    invariants: list[Any] | None = None,
+) -> str:
+    """Build per-turn invariant injection block for prose-repeat or ledger modes."""
+    if invariant_mode == "prose-repeat":
+        lines = [
+            "--- NON-NEGOTIABLE INVARIANTS (REPEATED EVERY TURN) ---",
+            "- preserve_fk_user_id (Referential): orders.user_id must remain NOT NULL and maintain CONSTRAINT fk_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE.",
+            "- preserve_monetary_integer_precision (Financial): Monetary columns (total_cents, amount_cents, discount_cents, shipping_cents, unit_cents) must use exact integer types (BIGINT, INT, INTEGER, SMALLINT), never floating-point (FLOAT, REAL, DOUBLE PRECISION) or unconstrained NUMERIC.",
+            "- preserve_users_email_uniqueness (Identity): users.email must remain NOT NULL and UNIQUE (column or table constraint).",
+            "- ast_syntax_validity (Compiler): Output must contain valid, parseable PostgreSQL DDL with zero syntax errors.",
+            "- temporal_state_consistency (Temporal): Turn 12+: orders.status CHECK must allow 'disputed'. Turn 28+: supersede with 'chargeback_pending' and forbid 'disputed' (no attention ghosting from older turns).",
+            "- cross_artifact_type_sync (Dual-AST): Outlaw mode requires synchronized Pydantic v2 OrderModel/UserModel python blocks; all orders columns present, user_id never Optional, *_cents never float.",
+            "- workload_retention (Retention): Retain every table, column, CHECK constraint, and index established in prior turns.",
+        ]
+        if invariants:
+            for item in invariants:
+                rule_txt = getattr(item, "rule", None)
+                name_txt = getattr(item, "name", None)
+                if name_txt and rule_txt:
+                    lines.append(f"  * [{name_txt}]: {str(rule_txt).strip()}")
+        return "\n".join(lines)
+    if invariant_mode == "ledger":
+        return dedent(
+            """
+            --- INVARIANT LEDGER (MACHINE-READABLE / ENFORCED) ---
+            INV-01: INTEGER_CENTS    | *_cents IN {INTEGER, BIGINT, SMALLINT}; FORBID FLOAT/DOUBLE/DECIMAL
+            INV-02: FK_CASCADE       | orders.user_id NOT NULL + CONSTRAINT fk_user_id REFERENCES users(id) ON DELETE CASCADE
+            INV-03: INDEX_RETENTION  | Retain 100% of prior tables, columns, CHECKs, and indexes (incl. partial indexes)
+            INV-04: PYDANTIC_SYNC    | Outlaw: UserModel & OrderModel 100% synced; user_id: int, *_cents: int
+            INV-05: EMAIL_UNIQUE     | users.email NOT NULL UNIQUE
+            INV-06: TEMPORAL_STATUS  | T12-27 allow 'disputed'; T28+ require 'chargeback_pending' & forbid 'disputed'
+            """
+        ).strip()
+    return ""
+
+
+def decorate_turn_prompt(
+    base_prompt: str,
+    invariant_mode: InvariantMode = "baseline",
+    invariants: list[Any] | None = None,
+) -> str:
+    """Append mode-specific invariant reminder without altering canonical workload definitions."""
+    if invariant_mode in ("baseline", "verify-commit"):
+        return base_prompt
+    reminder = format_invariant_reminder(invariant_mode, invariants=invariants)
+    if not reminder:
+        return base_prompt
+    return f"{base_prompt}\n\n{reminder}"
+
+
+def _apply_retention_stubs(
+    base_sql: str,
+    turn: int,
+    *,
+    exclude_artifacts: set[str] | None = None,
+) -> str:
+    excluded = exclude_artifacts or set()
     stubs: list[str] = []
     seen: set[str] = set()
     for artifact in expected_artifacts_for_turn(turn):
-        if artifact in seen or artifact in BASELINE_RETENTION_ARTIFACTS:
+        if artifact in seen or artifact in BASELINE_RETENTION_ARTIFACTS or artifact in excluded:
             continue
         ddl = _artifact_stub_ddl(artifact, turn)
         if ddl:
             stubs.append(ddl)
         seen.add(artifact)
     body = base_sql.strip()
-    if turn >= 12:
+    if turn >= 12 and "constraint:orders.status_check" not in excluded:
         stubs.append(_status_check_ddl(turn))
     if stubs:
         body = f"{body}\n\n-- simulated retention stubs\n" + "\n".join(stubs)
     return body
+
+
+def _cascading_fk_and_float_cents(base: str) -> str:
+    """Simulate a cascading regression where fixing an index accidentally breaks FK_CASCADE and INTEGER_CENTS."""
+    regressed_orders = """
+CREATE TABLE orders (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     BIGINT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    total_cents DOUBLE PRECISION NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+""".strip()
+    return base.replace(
+        "CREATE TABLE orders (\n"
+        "    id         BIGSERIAL PRIMARY KEY,\n"
+        "    user_id    BIGINT NOT NULL,\n"
+        "    status     TEXT NOT NULL DEFAULT 'pending',\n"
+        "    total_cents INTEGER NOT NULL CHECK (total_cents >= 0),\n"
+        "    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n"
+        "    CONSTRAINT fk_user_id\n"
+        "        FOREIGN KEY (user_id)\n"
+        "        REFERENCES users (id)\n"
+        "        ON DELETE CASCADE\n);",
+        regressed_orders,
+    )
 
 
 def _broken_schema_turn17_plus(base: str) -> str:
@@ -461,10 +546,78 @@ CREATE TABLE orders (
     return sql
 
 
-def generate_simulated_sql(turn: int) -> str:
-    """Deterministic schema for --sim: pass AST + retention for turns 1-16; fail turn 17+."""
+def generate_simulated_sql(
+    turn: int,
+    *,
+    invariant_mode: InvariantMode = "baseline",
+    retry_attempt: int = 0,
+    max_retries: int = 0,
+) -> str:
+    """Deterministic schema for --mode sim across invariant modes and self-repair attempts."""
     base = _SCHEMA_PATH.read_text(encoding="utf-8")
-    if turn >= 17:
+
+    # Active self-repair trajectory (verify-commit or max_retries > 0)
+    if invariant_mode == "verify-commit" or max_retries > 0:
+        if turn < 18:
+            return _apply_retention_stubs(base, turn)
+        if turn == 18:
+            # Attempt 0: drops partial index idx_orders_cancelled_at (INV-03 fails)
+            if retry_attempt == 0:
+                return _apply_retention_stubs(
+                    base,
+                    turn,
+                    exclude_artifacts={"index:idx_orders_cancelled_at"},
+                )
+            # Retry 1: restores idx_orders_cancelled_at, but triggers 2 Cascading Regressions (INV-01 + INV-02)
+            if retry_attempt == 1:
+                regressed = _cascading_fk_and_float_cents(base)
+                return _apply_retention_stubs(regressed, turn)
+            # Retry 2+: resolves both while retaining idx_orders_cancelled_at
+            return _apply_retention_stubs(base, turn)
+        if 19 <= turn <= 23:
+            return _apply_retention_stubs(base, turn)
+        if turn == 24:
+            # Attempt 0: single invariant failure (drops idx_orders_metadata_gin)
+            if retry_attempt == 0:
+                return _apply_retention_stubs(
+                    base,
+                    turn,
+                    exclude_artifacts={"index:idx_orders_metadata_gin"},
+                )
+            # Retry 1+: clean recovery with 0 cascading regressions
+            return _apply_retention_stubs(base, turn)
+        if 25 <= turn <= 30:
+            return _apply_retention_stubs(base, turn)
+        # Turn 31+: retry budget exhaustion under deep context load
+        if retry_attempt == 0:
+            # Attempt 0: fails INV-01 + INV-02 + INV-03
+            regressed = _cascading_fk_and_float_cents(base)
+            return _apply_retention_stubs(
+                regressed,
+                turn,
+                exclude_artifacts={"index:idx_orders_cancelled_at"},
+            )
+        # Retries 1..max_retries: fails to converge and introduces 1 additional cascading break (INV-05 email uniqueness)
+        broken = _broken_schema_turn17_plus(base)
+        return _apply_retention_stubs(
+            broken,
+            turn,
+            exclude_artifacts={"index:idx_orders_cancelled_at"},
+        )
+
+    # Non-repair prompt-control modes (max_retries == 0)
+    if invariant_mode == "prose-repeat":
+        if turn >= 21:
+            base = _broken_schema_turn17_plus(base)
+        return _apply_retention_stubs(base, turn)
+
+    if invariant_mode == "ledger":
+        if turn >= 26:
+            base = _broken_schema_turn17_plus(base)
+        return _apply_retention_stubs(base, turn)
+
+    # Default baseline mode (100% untouched: pass 1..17, drift at turn 18)
+    if turn >= 18:
         base = _broken_schema_turn17_plus(base)
     return _apply_retention_stubs(base, turn)
 
