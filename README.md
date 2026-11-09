@@ -21,10 +21,10 @@ git clone https://github.com/parrot-software-bc/polydyno.git
 cd polydyno
 python -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e .
+pip install -e .           # or: pip install -r requirements.txt (pins match pyproject.toml)
 ```
 
-Copy `.env.example` to `.env` before running live API models:
+Copy `.env.example` to `.env` before running live API models (API keys are only required for `--mode live`; simulation uses `--mode sim` and needs no keys):
 
 ```bash
 cp .env.example .env
@@ -42,7 +42,7 @@ polydyno --mode sim --open-chart
 polydyno --mode sim --invariant-mode verify-commit --max-retries 3 --open-chart
 ```
 
-Run artifacts are saved to `results/`:
+Run artifacts are written locally under `results/` (gitignored — not shipped in the repository):
 
 | File | Purpose |
 | :--- | :--- |
@@ -349,14 +349,16 @@ Polydyno is the diagnostic dyno that pinpoints where coding agents fail under lo
 
 ## PolyScore calibration anchors
 
-These scores are **regression anchors** for the harness scoring model (BSFC / anti-dilution). Changing formulas requires updating this table and re-verifying saved sheets in `results/`.
+These scores are **regression anchors** for the harness scoring model (BSFC / anti-dilution). Changing formulas requires updating this table and re-verifying scores from freshly exported `results/dyno_sheet_<timestamp>.json` files on your machine.
+
+**Sim rows** are reproduced directly from the commands below. **Live rows** are reference outcomes from canonical workload runs; after you execute the listed live flags, PolyScore and telemetry appear in your local `results/dyno_sheet_*.json` (timestamped filenames vary — e.g. `dyno_sheet_20261109_174943.json` — and are never committed to git).
 
 | Run | PolyScore | Structural Torque | Thermal (effective) |
 | :--- | :--- | :--- | :--- |
 | `polydyno --mode sim` (baseline) | **245** | 233 | A+ [×1.05] |
 | `polydyno --mode sim --invariant-mode verify-commit --max-retries 3` | **179** | 218 | B [×0.82] |
-| Live gpt-4o baseline (`results/dyno_sheet_20261109_174412.json`) | **245** | 233 | A+ [×1.05] |
-| Live gpt-4o verify-commit (`results/dyno_sheet_20261109_174943.json`) | **146** | 324 | D [×0.45] |
+| Live gpt-4o baseline — `polydyno --mode live --provider openai --model gpt-4o --load stage2 --invariant-mode baseline` | **245** | 233 | A+ [×1.05] |
+| Live gpt-4o verify-commit — `polydyno --mode live --provider openai --model gpt-4o --load stage2 --invariant-mode verify-commit --max-retries 3` | **146** | 324 | D [×0.45] |
 
 Canonical workload verification prefix (unchanged): `aa13421a3cdf`.
 
