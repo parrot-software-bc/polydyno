@@ -1,6 +1,6 @@
 # 🏎️ Polydyno (v0.2.0)
 
-**By [Polycracker](https://polycracker.dev)** — the 50-turn adversarial context drift and invariant benchmark harness for AI coding agents.
+A standardized 50-turn adversarial context drift and invariant benchmark harness for AI coding agents.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -339,11 +339,15 @@ Running custom `--schema` or `--invariants` files automatically tags the output 
 
 ---
 
-## The Polycracker Ecosystem
+### Architecture & Context Mitigations
 
-Polydyno is the diagnostic dyno that pinpoints where coding agents fail under load: invariant drift, financial type dilution, temporal ghosting, and retry thrash.
+Benchmarking stock models on Polydyno demonstrates why unpruned, conversational retry loops fail under sustained load. Mitigating context drift in production typically requires architectural guardrails:
 
-**[Polycracker](https://polycracker.dev)** provides the runtime edge guardrails and MCP tools to prevent context detonation in production: enforcing AST constraints before state commits, compressing prompt history, and eliminating cascading regressions across continuous agent sessions.
+- **Pre-Commit AST Gates:** Deterministically rejecting violating SQL/Pydantic diffs before they enter state history.
+- **Structured Rejection Diffing:** Packaging failure evidence to repair against the last clean checkpoint rather than editing in-place against stale context.
+- **External Invariant Ledgers:** Maintaining immutable schema constraints and identity rules outside the conversational prompt window.
+
+*For reference implementations of local context guardrails and MCP state anchors, see the [Polycracker architecture specifications](https://polycracker.dev).*
 
 ---
 
