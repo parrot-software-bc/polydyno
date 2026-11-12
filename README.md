@@ -213,6 +213,24 @@ Saved in `dyno_sheet_*.json` `metadata` and surfaced on the ASCII slip / Chart.j
 
 ---
 
+### 📊 Output Efficiency & Collateral Churn (Measuring Output Bloat)
+
+Polydyno measures agent performance using a dual-axis benchmark: we track problem-solving capability (Correctness) strictly separated from codebase thrashing and bloat (Efficiency). 
+
+Agents that panic and hallucinate massive amounts of boilerplate to solve simple invariants are caught by our isolated **Output Efficiency** channel. **Crucially, these metrics DO NOT alter the core Structural Torque or PolyScore.** They act as a secondary diagnostic sensor to prove how hard an agent thrashed to achieve its passing state.
+
+* **Net Diff (Lines Touched):** Tracks the raw footprint of the agent's edits (`+added` / `-removed`).
+* **Collateral Churn (Excess Edit Distance):** Measures the true cost of an agent's workflow using Levenshtein distance. We subtract the net insertion length to isolate *excess* character mutations—exposing agents that needlessly rewrite, reformat, or destroy existing valid code.
+* **Cumulative Retry Churn:** If an agent botches a prompt and hits a `verify-commit` retry loop, Polydyno sums the churn across all failed attempts. Botched panic-coding directly spikes the final output bloat metric.
+
+### 📈 The Dual-Stacked HTML Telemetry Report
+Running `--mode sim` outputs a self-contained, dark-mode HTML report featuring a professional dual-stacked telemetry layout:
+
+1. **Top Canvas (⚡ Capability vs. Output Bloat):** Maps the agent's progressive **Structural Torque** (green capability curve) against **Collateral Churn** (crimson regression spikes). This visually exposes the exact turn where an agent loses the context window—showing a drop in correctness perfectly aligned with a massive spike in output churn.
+2. **Bottom Canvas (🔥 Context & Spend):** Tracks input tokens, recovery tokens (self-repair), and cumulative API cost ($) on isolated scales.
+
+---
+
 ### Worked examples
 
 #### Primary empirical anchor — live `gpt-4o` verify-commit

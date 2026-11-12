@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -63,6 +64,10 @@ class ValidationResult(BaseModel):
     thermal_efficiency_ratio: float = 0.0
     token_multiplier: float = 0.0
     thermal_bloat: bool = False
+    lines_added: int = 0
+    lines_removed: int = 0
+    net_diff_lines: int = 0
+    collateral_churn_chars: int = 0
 
 
 class InvariantSpec(BaseModel):
@@ -168,6 +173,72 @@ def compute_thermal_metrics(
     quadratic_bloat = total_in > 22_000 and io_ratio > 22.0
     thermal_bloat = char_bloat or quadratic_bloat
     return thermal_efficiency_ratio, token_multiplier, thermal_bloat
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Exact character-level Levenshtein edit distance using 1D DP."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(a) < len(b):
+        a, b = b, a
+    prev_row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr_row = [i]
+        for j, cb in enumerate(b, start=1):
+            insert_cost = curr_row[j - 1] + 1
+            delete_cost = prev_row[j] + 1
+            replace_cost = prev_row[j - 1] + (0 if ca == cb else 1)
+            curr_row.append(min(insert_cost, delete_cost, replace_cost))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def compute_output_efficiency_metrics(
+    previous_sql: str | None,
+    current_sql: str | None,
+) -> tuple[int, int, int, int]:
+    """Compute (lines_added, lines_removed, net_diff_lines, collateral_churn_chars).
+
+    Collateral Churn is defined as excess character edits beyond the net insertion/deletion
+    length: max(0, Levenshtein(prev, curr) - abs(len(curr) - len(prev))).
+    """
+    prev = (previous_sql or "").strip()
+    curr = (current_sql or "").strip()
+    if not prev and not curr:
+        return 0, 0, 0, 0
+
+    prev_lines = prev.splitlines()
+    curr_lines = curr.splitlines()
+    matcher = difflib.SequenceMatcher(None, prev_lines, curr_lines)
+
+    lines_added = 0
+    lines_removed = 0
+    lev_distance = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        removed_count = i2 - i1
+        added_count = j2 - j1
+        lines_removed += removed_count
+        lines_added += added_count
+        prev_chunk = "\n".join(prev_lines[i1:i2])
+        curr_chunk = "\n".join(curr_lines[j1:j2])
+        if tag == "insert":
+            lev_distance += len(curr_chunk) + (1 if prev_lines and j1 > 0 else 0)
+        elif tag == "delete":
+            lev_distance += len(prev_chunk) + (1 if curr_lines and i1 > 0 else 0)
+        else:
+            lev_distance += _levenshtein_distance(prev_chunk, curr_chunk)
+
+    net_diff_lines = lines_added + lines_removed
+    net_len_delta = abs(len(curr) - len(prev))
+    collateral_churn_chars = max(0, lev_distance - net_len_delta)
+    return lines_added, lines_removed, net_diff_lines, collateral_churn_chars
 
 
 def _status_literals_from_sql(sql: str) -> set[str]:
@@ -584,12 +655,18 @@ def validate_response(
     input_tokens: int = 0,
     output_tokens: int = 0,
     invariants: list[InvariantSpec] | None = None,
+    previous_sql: str | None = None,
 ) -> ValidationResult:
     if invariants is None:
         if invariants_path is None:
             raise ValueError("validate_response requires invariants_path or invariants=")
         invariants = _load_invariants(invariants_path)
     sql = extract_sql_block(raw_response)
+    lines_added, lines_removed, net_diff_lines, collateral_churn_chars = (
+        compute_output_efficiency_metrics(previous_sql, sql if sql is not None else raw_response)
+        if previous_sql is not None
+        else (0, 0, 0, 0)
+    )
     if sql is None:
         eff, mult, bloat = compute_thermal_metrics(
             input_tokens=input_tokens,
@@ -607,6 +684,10 @@ def validate_response(
             thermal_efficiency_ratio=eff,
             token_multiplier=mult,
             thermal_bloat=bloat,
+            lines_added=lines_added,
+            lines_removed=lines_removed,
+            net_diff_lines=net_diff_lines,
+            collateral_churn_chars=collateral_churn_chars,
         )
 
     violated: list[str] = []
@@ -633,6 +714,10 @@ def validate_response(
             violated_invariants=violated,
             failed_invariant_ids=map_violated_to_invariant_ids(violated, missing),
             diagnostic_reason=diagnostic,
+            lines_added=lines_added,
+            lines_removed=lines_removed,
+            net_diff_lines=net_diff_lines,
+            collateral_churn_chars=collateral_churn_chars,
         )
 
     assert schema is not None
@@ -716,4 +801,8 @@ def validate_response(
         thermal_efficiency_ratio=thermal_efficiency_ratio,
         token_multiplier=token_multiplier,
         thermal_bloat=thermal_bloat,
+        lines_added=lines_added,
+        lines_removed=lines_removed,
+        net_diff_lines=net_diff_lines,
+        collateral_churn_chars=collateral_churn_chars,
     )

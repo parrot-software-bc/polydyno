@@ -473,6 +473,7 @@ def run_dyno(args: argparse.Namespace) -> int:
                 input_tokens=completion.input_tokens,
                 output_tokens=completion.output_tokens,
                 invariants=invariants,
+                previous_sql=last_valid_sql,
             )
 
             initial_failed_list = list(validation.failed_invariant_ids)
@@ -484,6 +485,10 @@ def run_dyno(args: argparse.Namespace) -> int:
             total_out_tokens = completion.output_tokens
             total_cached_tokens = completion.cached_input_tokens
             total_latency_ms = completion.latency_ms
+            total_lines_added = validation.lines_added
+            total_lines_removed = validation.lines_removed
+            total_net_diff_lines = validation.net_diff_lines
+            total_collateral_churn_chars = validation.collateral_churn_chars
             latest_completion = completion
             current_sql = extract_sql_block(completion.assistant_text) or ""
 
@@ -525,7 +530,12 @@ def run_dyno(args: argparse.Namespace) -> int:
                         input_tokens=total_in_tokens,
                         output_tokens=total_out_tokens,
                         invariants=invariants,
+                        previous_sql=last_valid_sql,
                     )
+                    total_lines_added += validation.lines_added
+                    total_lines_removed += validation.lines_removed
+                    total_net_diff_lines += validation.net_diff_lines
+                    total_collateral_churn_chars += validation.collateral_churn_chars
                     current_failed_set = set(validation.failed_invariant_ids)
                     for new_id in current_failed_set - initial_failed_set:
                         seen_cascading_ids.add(new_id)
@@ -578,6 +588,10 @@ def run_dyno(args: argparse.Namespace) -> int:
                 recovery_tokens=recovery_tokens,
                 cascading_regressions=cascading_regressions,
                 recovered_cleanly=recovered_cleanly,
+                lines_added=total_lines_added,
+                lines_removed=total_lines_removed,
+                net_diff_lines=total_net_diff_lines,
+                collateral_churn_chars=total_collateral_churn_chars,
             )
             dashboard.record_turn(record)
             sheet.turns.append(record)

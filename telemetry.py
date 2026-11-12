@@ -67,6 +67,10 @@ class TurnRecord(BaseModel):
     recovery_tokens: int = 0
     cascading_regressions: int = 0
     recovered_cleanly: bool = False
+    lines_added: int = 0
+    lines_removed: int = 0
+    net_diff_lines: int = 0
+    collateral_churn_chars: int = 0
 
 
 class DynoRunSheet(BaseModel):
@@ -433,6 +437,29 @@ def calculate_polyscore(
     return max(0, min(1000, raw))
 
 
+def _output_efficiency_totals(sheet: DynoRunSheet) -> dict[str, Any]:
+    """Aggregate isolated Output Efficiency metrics without touching PolyScore or Torque."""
+    turns = sheet.turns
+    n = max(len(turns), 1)
+    total_added = sum(t.lines_added for t in turns)
+    total_removed = sum(t.lines_removed for t in turns)
+    total_net_diff = sum(t.net_diff_lines for t in turns)
+    total_churn = sum(t.collateral_churn_chars for t in turns)
+    peak_turn = max(turns, key=lambda t: t.collateral_churn_chars, default=None)
+    return {
+        "total_lines_added": total_added,
+        "total_lines_removed": total_removed,
+        "total_net_diff_lines": total_net_diff,
+        "avg_lines_added": round(total_added / n, 2),
+        "avg_lines_removed": round(total_removed / n, 2),
+        "avg_net_diff_lines": round(total_net_diff / n, 2),
+        "total_collateral_churn_chars": total_churn,
+        "avg_collateral_churn_chars": round(total_churn / n, 1),
+        "peak_churn_turn": peak_turn.turn if peak_turn is not None else None,
+        "peak_churn_chars": peak_turn.collateral_churn_chars if peak_turn is not None else 0,
+    }
+
+
 def finalize_polyscore(sheet: DynoRunSheet) -> None:
     _refresh_turn_bsfc_flags(sheet)
     agg = _compute_bsfc_aggregate(sheet)
@@ -445,6 +472,7 @@ def finalize_polyscore(sheet: DynoRunSheet) -> None:
     sheet.metadata["bloat_turns"] = int(agg["bloat_turns"])
     sheet.metadata["pre_failure_tokens"] = pre_failure
     sheet.metadata["post_failure_runaway_tokens"] = post_failure
+    sheet.metadata["output_efficiency"] = _output_efficiency_totals(sheet)
     if first_drop is not None and pre_failure > 0:
         sheet.metadata["context_runaway_factor"] = round(
             int(agg["total_input_tokens"]) / pre_failure,
@@ -940,7 +968,44 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
         padding=(0, 1),
     )
 
-    parts: list[RenderableType] = [polyscore_hero, summary, containment, spark_panel, drift_line]
+    out_eff = _output_efficiency_totals(sheet)
+    output_efficiency_table = Table(
+        title="OUTPUT EFFICIENCY (ISOLATED)",
+        box=box.ROUNDED,
+        expand=False,
+    )
+    output_efficiency_table.add_column("Metric", style="bold", no_wrap=True)
+    output_efficiency_table.add_column("Value", justify="right", no_wrap=True)
+    output_efficiency_table.add_row(
+        "Net Diff (Cumulative)",
+        f"+{out_eff['total_lines_added']:,} / -{out_eff['total_lines_removed']:,} lines "
+        f"({out_eff['total_net_diff_lines']:,} lines touched)",
+    )
+    output_efficiency_table.add_row(
+        "Avg Net Diff / Turn",
+        f"+{out_eff['avg_lines_added']:.1f} / -{out_eff['avg_lines_removed']:.1f} lines "
+        f"({out_eff['avg_net_diff_lines']:.1f} avg)",
+    )
+    output_efficiency_table.add_row(
+        "Collateral Churn (Excess Edit Dist)",
+        f"{out_eff['total_collateral_churn_chars']:,} chars rewritten "
+        f"({out_eff['avg_collateral_churn_chars']:,.1f}/turn)",
+    )
+    peak_turn_label = (
+        f"Turn {out_eff['peak_churn_turn']} ({out_eff['peak_churn_chars']:,} chars)"
+        if out_eff["peak_churn_turn"] is not None
+        else "none"
+    )
+    output_efficiency_table.add_row("Peak Turn Churn", peak_turn_label)
+
+    parts: list[RenderableType] = [
+        polyscore_hero,
+        output_efficiency_table,
+        summary,
+        containment,
+        spark_panel,
+        drift_line,
+    ]
     first_drift_row = next((t for t in turns if not t.invariant_intact), None)
     if first_drift_row is not None:
         parts.append(
@@ -956,11 +1021,31 @@ def render_summary(sheet: DynoRunSheet, console: Console | None = None) -> None:
     console.print(Panel(Group(*parts), border_style="green"))
 
 
+def _cumulative_torque_series(sheet: DynoRunSheet) -> list[int]:
+    """Compute progressive Structural Torque at each turn 1..N for the Power Band chart."""
+    turns = sheet.turns
+    if not turns:
+        return []
+    series: list[int] = []
+    for idx in range(1, len(turns) + 1):
+        partial = DynoRunSheet(
+            started_at=sheet.started_at,
+            finished_at=sheet.finished_at,
+            provider=sheet.provider,
+            model=sheet.model,
+            total_turns=sheet.total_turns,
+            turns=turns[:idx],
+            metadata=dict(sheet.metadata),
+        )
+        series.append(compute_structural_torque(partial))
+    return series
+
+
 def export_html_dyno_chart(
     sheet: DynoRunSheet,
     results_dir: str | Path = "results",
 ) -> Path:
-    """Self-contained dark-mode HTML dashboard with Chart.js dyno plot."""
+    """Self-contained dark-mode HTML dashboard with dual Chart.js dyno plots."""
     turns = sheet.turns
     labels = [str(t.turn) for t in turns]
     input_tokens = [t.input_tokens for t in turns]
@@ -968,10 +1053,22 @@ def export_html_dyno_chart(
     repair_attempts_series = [t.repair_attempts for t in turns]
     cascading_series = [t.cascading_regressions for t in turns]
     costs = [t.cumulative_cost_usd for t in turns]
+    collateral_churn_series = [t.collateral_churn_chars for t in turns]
+    net_diff_series = [t.net_diff_lines for t in turns]
+    lines_added_series = [t.lines_added for t in turns]
+    lines_removed_series = [t.lines_removed for t in turns]
+    torque_series = _cumulative_torque_series(sheet)
     retention_pct = []
     for t in turns:
         frac = parse_retention_fraction(t.retention_score)
         retention_pct.append(round(frac * 100, 2) if frac is not None else None)
+
+    out_eff = _output_efficiency_totals(sheet)
+    peak_churn_label = (
+        f"Turn {out_eff['peak_churn_turn']} ({out_eff['peak_churn_chars']:,} chars)"
+        if out_eff["peak_churn_turn"] is not None
+        else "none"
+    )
 
     drift_turn = _first_drift_turn(sheet)
     total_input = sum(t.input_tokens for t in turns)
@@ -1165,12 +1262,21 @@ def export_html_dyno_chart(
       <div class="kpi"><label>Recovery Token Overhead</label><strong>+{total_recovery_tokens:,} tok (+{overhead_pct:.1f}% vs pre-drop → {base_thermal}→{grade} x{thermal_mult:.2f})</strong></div>
       <div class="kpi"><label>Thermal Bloat Turns</label><strong>{bloat_turns}</strong></div>
       <div class="kpi"><label>Thermal Efficiency</label><strong>{avg_eff:.4f}</strong></div>
+      <div class="kpi"><label>Net Diff (Cumulative)</label><strong>+{out_eff['total_lines_added']:,} / -{out_eff['total_lines_removed']:,} ({out_eff['total_net_diff_lines']:,} lines · {out_eff['avg_net_diff_lines']:.1f}/turn)</strong></div>
+      <div class="kpi"><label>Collateral Churn (Excess Edit Dist)</label><strong>{out_eff['total_collateral_churn_chars']:,} chars ({out_eff['avg_collateral_churn_chars']:,.1f}/turn · Peak {peak_churn_label})</strong></div>
       <div class="kpi"><label>Total Tokens (in+out)</label><strong>{total_input + total_output:,}</strong></div>
       <div class="kpi"><label>Total Cost</label><strong>${final_cost:.4f}</strong></div>
       <div class="kpi"><label>Invariant Pass Rate</label><strong>{pass_rate}</strong></div>
     </div>
     <div class="panel">
-      <canvas id="dynoPlot"></canvas>
+      <h2 style="margin-top:0;margin-bottom:4px;font-size:1rem;">⚡ Power Band vs. Parasitic Output Churn (Dyno Crossover)</h2>
+      <p style="margin:0 0 12px;font-size:0.82rem;color:var(--muted);">Left Y: Structural Torque (0–1000) &amp; Retention (%) · Right Y: Collateral Churn (excess edit chars) &amp; Net Diff (lines touched)</p>
+      <canvas id="dynoPowerPlot"></canvas>
+    </div>
+    <div class="panel">
+      <h2 style="margin-top:0;margin-bottom:4px;font-size:1rem;">🔥 Fuel Burn &amp; Context Telemetry (Tokens &amp; Cost)</h2>
+      <p style="margin:0 0 12px;font-size:0.82rem;color:var(--muted);">Left Y: Input Tokens &amp; Self-Repair Recovery Tokens · Right Y: Cumulative API Cost (USD)</p>
+      <canvas id="dynoTokenPlot"></canvas>
     </div>
     <div class="panel">
       <h2 style="margin-top:0;font-size:1rem;">Black Box Autopsy</h2>
@@ -1190,11 +1296,22 @@ def export_html_dyno_chart(
     const cascadingBreaks = {cascading_series!r};
     const costs = {costs!r};
     const retentionPct = {retention_pct!r};
+    const torqueSeries = {torque_series!r};
+    const collateralChurn = {collateral_churn_series!r};
+    const netDiffLines = {net_diff_series!r};
+    const linesAdded = {lines_added_series!r};
+    const linesRemoved = {lines_removed_series!r};
     const driftTurn = {drift_turn_js};
-    const pointColors = labels.map((_, idx) => {{
+    const tokenPointColors = labels.map((_, idx) => {{
       if (cascadingBreaks[idx] > 0) return '#ff4d4f';
       if (repairAttempts[idx] > 0) return '#f0883e';
       return '#58a6ff';
+    }});
+    const powerPointColors = labels.map((_, idx) => {{
+      if (driftTurn !== null && String(labels[idx]) === String(driftTurn)) return '#ff4d4f';
+      if (cascadingBreaks[idx] > 0) return '#ff4d4f';
+      if (repairAttempts[idx] > 0) return '#f0883e';
+      return '#3fb950';
     }});
     const pointRadii = labels.map((_, idx) => (repairAttempts[idx] > 0 || cascadingBreaks[idx] > 0 ? 7 : 3));
     const driftCliffPlugin = {{
@@ -1240,8 +1357,109 @@ def export_html_dyno_chart(
         ctx2.restore();
       }},
     }};
-    const ctx = document.getElementById('dynoPlot');
-    new Chart(ctx, {{
+
+    const powerCtx = document.getElementById('dynoPowerPlot');
+    new Chart(powerCtx, {{
+      plugins: [driftCliffPlugin],
+      type: 'line',
+      data: {{
+        labels,
+        datasets: [
+          {{
+            label: 'Structural Torque (Power Band)',
+            data: torqueSeries,
+            borderColor: '#3fb950',
+            backgroundColor: 'rgba(63,185,80,0.14)',
+            fill: true,
+            pointBackgroundColor: powerPointColors,
+            pointBorderColor: powerPointColors,
+            pointRadius: pointRadii,
+            borderWidth: 2.5,
+            yAxisID: 'yPower',
+            tension: 0.2,
+            order: 1,
+          }},
+          {{
+            label: 'Retention %',
+            data: retentionPct,
+            borderColor: '#58a6ff',
+            backgroundColor: 'rgba(88,166,255,0.08)',
+            borderDash: [5, 4],
+            pointRadius: 2,
+            borderWidth: 1.8,
+            yAxisID: 'yPower',
+            spanGaps: true,
+            tension: 0.2,
+            order: 2,
+          }},
+          {{
+            type: 'bar',
+            label: 'Collateral Churn (Excess Edit Chars)',
+            data: collateralChurn,
+            borderColor: '#ff4d4f',
+            backgroundColor: 'rgba(255,77,79,0.55)',
+            borderWidth: 1,
+            yAxisID: 'yChurn',
+            order: 3,
+          }},
+          {{
+            label: 'Net Diff (Lines Touched)',
+            data: netDiffLines,
+            borderColor: '#f0883e',
+            backgroundColor: 'rgba(240,136,62,0.20)',
+            pointBackgroundColor: '#f0883e',
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'yChurn',
+            tension: 0.2,
+            order: 2,
+          }},
+        ],
+      }},
+      options: {{
+        responsive: true,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{
+          legend: {{ labels: {{ color: '#e6edf3' }} }},
+          tooltip: {{
+            callbacks: {{
+              afterBody(items) {{
+                if (!items || !items.length) return '';
+                const idx = items[0].dataIndex;
+                return `Line Diff Breakdown: +${{linesAdded[idx]}} / -${{linesRemoved[idx]}} lines`;
+              }},
+            }},
+          }},
+        }},
+        scales: {{
+          x: {{
+            ticks: {{ color: '#8b949e' }},
+            grid: {{ color: '#30363d' }},
+            title: {{ display: true, text: 'Turn (RPM Sweep)', color: '#8b949e' }},
+          }},
+          yPower: {{
+            type: 'linear',
+            position: 'left',
+            min: 0,
+            suggestedMax: 400,
+            ticks: {{ color: '#3fb950' }},
+            grid: {{ color: '#30363d' }},
+            title: {{ display: true, text: 'Structural Torque (0–1000) / Retention (%)', color: '#3fb950' }},
+          }},
+          yChurn: {{
+            type: 'linear',
+            position: 'right',
+            min: 0,
+            ticks: {{ color: '#ff7b72' }},
+            grid: {{ drawOnChartArea: false }},
+            title: {{ display: true, text: 'Parasitic Loss: Collateral Churn (chars) & Net Diff (lines)', color: '#ff7b72' }},
+          }},
+        }},
+      }},
+    }});
+
+    const tokenCtx = document.getElementById('dynoTokenPlot');
+    new Chart(tokenCtx, {{
       plugins: [driftCliffPlugin],
       type: 'line',
       data: {{
@@ -1252,10 +1470,10 @@ def export_html_dyno_chart(
             data: inputTokens,
             borderColor: '#58a6ff',
             backgroundColor: 'rgba(88,166,255,0.15)',
-            pointBackgroundColor: pointColors,
-            pointBorderColor: pointColors,
+            pointBackgroundColor: tokenPointColors,
+            pointBorderColor: tokenPointColors,
             pointRadius: pointRadii,
-            yAxisID: 'y',
+            yAxisID: 'yTokens',
             tension: 0.2,
           }},
           {{
@@ -1264,23 +1482,14 @@ def export_html_dyno_chart(
             data: recoveryTokens,
             borderColor: '#f0883e',
             backgroundColor: 'rgba(240,136,62,0.45)',
-            yAxisID: 'y',
+            yAxisID: 'yTokens',
           }},
           {{
             label: 'Cumulative Cost ($)',
             data: costs,
             borderColor: '#d2a8ff',
             backgroundColor: 'rgba(210,168,255,0.12)',
-            yAxisID: 'y',
-            tension: 0.2,
-          }},
-          {{
-            label: 'Retention %',
-            data: retentionPct,
-            borderColor: '#3fb950',
-            backgroundColor: 'rgba(63,185,80,0.12)',
-            yAxisID: 'y1',
-            spanGaps: true,
+            yAxisID: 'yCost',
             tension: 0.2,
           }},
         ],
@@ -1292,22 +1501,25 @@ def export_html_dyno_chart(
           legend: {{ labels: {{ color: '#e6edf3' }} }},
         }},
         scales: {{
-          x: {{ ticks: {{ color: '#8b949e' }}, grid: {{ color: '#30363d' }} }},
-          y: {{
-            type: 'linear',
-            position: 'left',
+          x: {{
             ticks: {{ color: '#8b949e' }},
             grid: {{ color: '#30363d' }},
-            title: {{ display: true, text: 'Input Tokens / Cost ($)', color: '#8b949e' }},
+            title: {{ display: true, text: 'Turn (RPM Sweep)', color: '#8b949e' }},
           }},
-          y1: {{
+          yTokens: {{
+            type: 'linear',
+            position: 'left',
+            ticks: {{ color: '#58a6ff' }},
+            grid: {{ color: '#30363d' }},
+            title: {{ display: true, text: 'Input & Recovery Tokens', color: '#58a6ff' }},
+          }},
+          yCost: {{
             type: 'linear',
             position: 'right',
             min: 0,
-            max: 100,
-            ticks: {{ color: '#3fb950' }},
+            ticks: {{ color: '#d2a8ff' }},
             grid: {{ drawOnChartArea: false }},
-            title: {{ display: true, text: 'Retention %', color: '#3fb950' }},
+            title: {{ display: true, text: 'Cumulative Cost ($)', color: '#d2a8ff' }},
           }},
         }},
       }},
